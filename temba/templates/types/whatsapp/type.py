@@ -11,20 +11,20 @@ class WhatsAppType(TemplateType):
         "PENDING": TemplateTranslation.STATUS_PENDING,
         "APPROVED": TemplateTranslation.STATUS_APPROVED,
         "REJECTED": TemplateTranslation.STATUS_REJECTED,
+        "PAUSED": TemplateTranslation.STATUS_PAUSED,
+        "DISABLED": TemplateTranslation.STATUS_DISABLED,
+        "IN_APPEAL": TemplateTranslation.STATUS_IN_APPEAL,
     }
 
     def update_local(self, channel, raw: dict):
         channel_namespace = channel.config.get("fb_namespace", "")
 
-        template_status = raw["status"].upper()
-        if template_status not in self.STATUS_MAPPING:  # ignore if this is a status we don't know about
+        raw_status = raw["status"].upper()
+        if raw_status not in self.STATUS_MAPPING:  # we handle statuses of DELETED or PENDING_DELETION by deleting
             return None
 
+        status = self.STATUS_MAPPING[raw_status]
         components, variables, supported = self._extract_components(raw["components"])
-
-        status = self.STATUS_MAPPING[template_status]
-        if not supported:
-            status = TemplateTranslation.STATUS_UNSUPPORTED
 
         return TemplateTranslation.get_or_create(
             channel,
@@ -36,6 +36,7 @@ class WhatsAppType(TemplateType):
             namespace=raw.get("namespace", channel_namespace),
             components=components,
             variables=variables,
+            is_supported=supported,
         )
 
     def _extract_components(self, raw: list) -> tuple:
@@ -54,8 +55,17 @@ class WhatsAppType(TemplateType):
                 map[name] = len(variables) - 1
             return map
 
+        raw_dict = dict()
         for component in raw:
-            comp_type = component["type"].upper()
+            if component["type"].upper() not in ["HEADER", "BODY", "FOOTER", "BUTTONS"]:
+                supported = False
+            raw_dict[component["type"].upper()] = component
+
+        for comp_type in ["HEADER", "BODY", "FOOTER", "BUTTONS"]:
+            component = raw_dict.get(comp_type)
+            if component is None:
+                continue
+
             comp_text = component.get("text", "")
 
             if comp_type == "HEADER":
@@ -126,7 +136,5 @@ class WhatsAppType(TemplateType):
 
                     else:
                         supported = False
-            else:
-                supported = False
 
         return components, variables, supported

@@ -29,8 +29,8 @@ class GlobalTest(TembaTest):
         self.assertEqual("Secret Value", global3.name)
         self.assertEqual("", global3.value)
 
-        flow1 = self.get_flow("color")
-        flow2 = self.get_flow("favorites")
+        flow1 = self.create_flow("Flow 1")
+        flow2 = self.create_flow("Flow 2")
 
         flow1.global_dependencies.add(global1, global2)
         flow2.global_dependencies.add(global1)
@@ -101,7 +101,7 @@ class GlobalCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(list(response.context["object_list"]), [self.global2])
 
         self.assertListFetch(unused_url, [self.user, self.editor, self.admin], context_objects=[self.global2])
-        self.assertContentMenu(list_url, self.admin, ["New Global"])
+        self.assertContentMenu(list_url, self.admin, ["New"])
 
     @override_settings(ORG_LIMIT_DEFAULTS={"globals": 4})
     def test_create(self):

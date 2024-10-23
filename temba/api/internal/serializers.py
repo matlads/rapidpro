@@ -4,6 +4,7 @@ from rest_framework import serializers
 
 from temba.locations.models import AdminBoundary
 from temba.templates.models import Template, TemplateTranslation
+from temba.tickets.models import Shortcut
 
 
 class ModelAsJsonSerializer(serializers.BaseSerializer):
@@ -17,33 +18,43 @@ class LocationReadSerializer(serializers.ModelSerializer):
         fields = ("osm_id", "name", "path")
 
 
+class ShortcutReadSerializer(serializers.ModelSerializer):
+    modified_on = serializers.DateTimeField(default_timezone=tzone.utc)
+
+    class Meta:
+        model = Shortcut
+        fields = ("uuid", "name", "text", "modified_on")
+
+
 class TemplateReadSerializer(serializers.ModelSerializer):
     STATUSES = {
-        TemplateTranslation.STATUS_APPROVED: "approved",
         TemplateTranslation.STATUS_PENDING: "pending",
+        TemplateTranslation.STATUS_APPROVED: "approved",
         TemplateTranslation.STATUS_REJECTED: "rejected",
-        TemplateTranslation.STATUS_UNSUPPORTED: "unsupported",
+        TemplateTranslation.STATUS_PAUSED: "paused",
+        TemplateTranslation.STATUS_DISABLED: "disabled",
+        TemplateTranslation.STATUS_IN_APPEAL: "in_appeal",
     }
 
-    translations = serializers.SerializerMethodField()
+    base_translation = serializers.SerializerMethodField()
     modified_on = serializers.DateTimeField(default_timezone=tzone.utc)
     created_on = serializers.DateTimeField(default_timezone=tzone.utc)
 
-    def get_translations(self, obj):
-        translations = []
-        for trans in obj.translations.all():
-            translations.append(
-                {
-                    "channel": {"uuid": str(trans.channel.uuid), "name": trans.channel.name},
-                    "namespace": trans.namespace,
-                    "locale": trans.locale,
-                    "status": self.STATUSES[trans.status],
-                    "components": trans.components,
-                    "variables": trans.variables,
-                }
-            )
-        return translations
+    def get_base_translation(self, obj):
+        return self._translation(obj.base_translation) if obj.base_translation else None
+
+    def _translation(self, trans):
+        return {
+            "channel": {"uuid": str(trans.channel.uuid), "name": trans.channel.name},
+            "namespace": trans.namespace,
+            "locale": trans.locale,
+            "status": self.STATUSES[trans.status],
+            "components": trans.components,
+            "variables": trans.variables,
+            "supported": trans.is_supported,
+            "compatible": trans.is_compatible,
+        }
 
     class Meta:
         model = Template
-        fields = ("uuid", "name", "translations", "created_on", "modified_on")
+        fields = ("uuid", "name", "base_translation", "created_on", "modified_on")

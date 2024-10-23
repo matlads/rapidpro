@@ -10,7 +10,7 @@ from temba.notifications.incidents.builtin import ChannelTemplatesFailedIncident
 from temba.notifications.models import Incident
 from temba.orgs.models import Org, OrgRole
 from temba.request_logs.models import HTTPLog
-from temba.tests import CRUDLTestMixin, MigrationTest, TembaTest
+from temba.tests import CRUDLTestMixin, TembaTest
 
 from .models import Template, TemplateTranslation
 from .tasks import refresh_templates
@@ -31,6 +31,7 @@ class TemplateTest(TembaTest):
             namespace="",
             components=[],
             variables=[],
+            is_supported=True,
         )
         self.assertIsNotNone(hello_eng.template)  # should have a template with name hello
         self.assertEqual("hello", hello_eng.template.name)
@@ -47,6 +48,7 @@ class TemplateTest(TembaTest):
             namespace="",
             components=[],
             variables=[],
+            is_supported=True,
         )
         self.assertEqual(hello_fra.template, hello_fra.template)
         self.assertGreater(hello_fra.template.modified_on, modified_on)  # should be updated
@@ -61,6 +63,7 @@ class TemplateTest(TembaTest):
             namespace="foo_namespace",
             components=[],
             variables=[],
+            is_supported=True,
         )
         self.assertNotEqual(hello_fra.template, goodbye_fra.template)
         self.assertTrue("goodbye", goodbye_fra.template.name)
@@ -75,6 +78,7 @@ class TemplateTest(TembaTest):
             namespace="foo_namespace",
             components=[],
             variables=[],
+            is_supported=True,
         )
         self.assertNotEqual(goodbye_fra, goodbye_fra_other_channel)
         self.assertEqual(goodbye_fra.template, goodbye_fra_other_channel.template)
@@ -94,43 +98,94 @@ class TemplateTest(TembaTest):
                     "components": [{"type": "BODY", "text": "Hello"}],
                     "language": "en",
                     "status": "APPROVED",
-                    "id": "1234",
+                    "id": "1001",
                 },
                 {
                     "name": "hello",
                     "components": [{"type": "BODY", "text": "Hola"}],
                     "language": "es",
                     "status": "PENDING",
-                    "id": "2345",
+                    "id": "1002",
+                },
+                {
+                    "name": "hello",
+                    "components": [{"type": "BODY", "text": "Bonjour {{1}}"}],
+                    "language": "fr",
+                    "status": "REJECTED",
+                    "id": "1003",
                 },
                 {
                     "name": "goodbye",
                     "components": [{"type": "BODY", "text": "Goodbye"}],
-                    "language": "en",
+                    "language": "fr",
                     "status": "PENDING",
-                    "id": "3456",
+                    "id": "2001",
                 },
             ],
         )
 
-        self.assertEqual({"hello", "goodbye"}, set(Template.objects.values_list("name", flat=True)))
-        self.assertEqual(3, TemplateTranslation.objects.filter(channel=channel, is_active=True).count())
+        hello, goodbye = self.org.templates.order_by("id")
+        self.assertEqual("hello", hello.name)
+        self.assertEqual("eng", hello.base_translation.locale)
+        self.assertEqual(3, hello.translations.count())
 
+        hello_eng, hello_spa, hello_fra = hello.translations.order_by("id")
+        self.assertEqual("eng", hello_eng.locale)
+        self.assertEqual(TemplateTranslation.STATUS_APPROVED, hello_eng.status)
+        self.assertTrue(hello_eng.is_supported)
+        self.assertTrue(hello_eng.is_compatible)
+        self.assertEqual("spa", hello_spa.locale)
+        self.assertEqual(TemplateTranslation.STATUS_PENDING, hello_spa.status)
+        self.assertTrue(hello_spa.is_supported)
+        self.assertTrue(hello_spa.is_compatible)
+        self.assertEqual("fra", hello_fra.locale)
+        self.assertEqual(TemplateTranslation.STATUS_REJECTED, hello_fra.status)
+        self.assertTrue(hello_fra.is_supported)
+        self.assertFalse(hello_fra.is_compatible)  # because of parameter mismatch
+
+        self.assertEqual("goodbye", goodbye.name)
+        self.assertEqual("fra", goodbye.base_translation.locale)
+        self.assertEqual(1, goodbye.translations.count())
+        self.assertEqual(4, channel.template_translations.count())
+
+        # update again, no more fra translation, and parameter added to eng, so spa should become incompatible
         TemplateTranslation.update_local(
             channel,
             [
                 {
                     "name": "hello",
-                    "components": [{"type": "BODY", "text": "Hello"}],
+                    "components": [{"type": "BODY", "text": "Hello {{1}}"}],
                     "language": "en",
                     "status": "APPROVED",
                     "id": "1234",
-                }
+                },
+                {
+                    "name": "hello",
+                    "components": [{"type": "BODY", "text": "Hola"}],
+                    "language": "es",
+                    "status": "APPROVED",
+                    "id": "1002",
+                },
             ],
         )
 
-        self.assertEqual({"hello", "goodbye"}, set(Template.objects.values_list("name", flat=True)))
-        self.assertEqual(1, channel.template_translations.count())
+        hello, goodbye = self.org.templates.order_by("id")
+        self.assertEqual("eng", hello.base_translation.locale)
+        self.assertEqual(2, hello.translations.count())
+
+        hello_eng, hello_spa = hello.translations.order_by("id")
+        self.assertEqual("eng", hello_eng.locale)
+        self.assertEqual(TemplateTranslation.STATUS_APPROVED, hello_eng.status)
+        self.assertTrue(hello_eng.is_supported)
+        self.assertTrue(hello_eng.is_compatible)
+        self.assertEqual("spa", hello_spa.locale)
+        self.assertEqual(TemplateTranslation.STATUS_APPROVED, hello_spa.status)
+        self.assertTrue(hello_spa.is_supported)
+        self.assertFalse(hello_spa.is_compatible)
+
+        self.assertIsNone(goodbye.base_translation)
+        self.assertEqual(0, goodbye.translations.count())
+        self.assertEqual(2, channel.template_translations.count())
 
     @patch("temba.templates.models.TemplateTranslation.update_local")
     @patch("temba.channels.types.twilio_whatsapp.TwilioWhatsappType.fetch_templates")
@@ -295,30 +350,31 @@ class TemplateCRUDLTest(CRUDLTestMixin, TembaTest):
         list_url = reverse("templates.template_list")
 
         channel = self.create_channel("D3C", "360Dialog channel", address="1234")
-        template1 = Template.objects.create(org=self.org, name="hello")
-        template2 = Template.objects.create(org=self.org, name="goodbye")
-
-        TemplateTranslation.objects.create(
-            template=template1, channel=channel, locale="eng-US", status=TemplateTranslation.STATUS_APPROVED
+        template1 = self.create_template(
+            "hello",
+            [
+                TemplateTranslation(channel=channel, locale="eng-US", status=TemplateTranslation.STATUS_APPROVED),
+                TemplateTranslation(channel=channel, locale="spa", status=TemplateTranslation.STATUS_APPROVED),
+                TemplateTranslation(channel=self.channel, locale="eng-US", status=TemplateTranslation.STATUS_PENDING),
+            ],
         )
-        TemplateTranslation.objects.create(
-            template=template1, channel=channel, locale="spa", status=TemplateTranslation.STATUS_APPROVED
+        template2 = self.create_template(
+            "goodbye", [TemplateTranslation(channel=channel, locale="eng", status=TemplateTranslation.STATUS_PENDING)]
         )
-        TemplateTranslation.objects.create(
-            template=template2, channel=channel, locale="eng", status=TemplateTranslation.STATUS_PENDING
-        )
-        TemplateTranslation.objects.create(
-            template=template1, channel=self.channel, locale="eng-US", status=TemplateTranslation.STATUS_PENDING
-        )
+        self.create_template("empty", [])  # templates with no translations shouldn't appear
 
         # add template and translation in other org
         channel_other_org = self.create_channel("D3C", "360Dialog channel", address="2345", org=self.org2)
-        template_other_org = Template.objects.create(org=self.org2, name="hello")
-        TemplateTranslation.objects.create(
-            template=template_other_org,
-            channel=channel_other_org,
-            locale="eng",
-            status=TemplateTranslation.STATUS_PENDING,
+        self.create_template(
+            "hello",
+            [
+                TemplateTranslation(
+                    channel=channel_other_org,
+                    locale="eng",
+                    status=TemplateTranslation.STATUS_PENDING,
+                )
+            ],
+            org=self.org2,
         )
 
         self.assertRequestDisallowed(list_url, [None, self.agent])
@@ -327,67 +383,67 @@ class TemplateCRUDLTest(CRUDLTestMixin, TembaTest):
         )
 
         self.assertContains(response, "goodbye")
-        self.assertContains(response, "1 translation,")
+        self.assertContains(response, "1 language,")
         self.assertContains(response, "hello")
-        self.assertContains(response, "3 translations,")
+        self.assertContains(response, "2 languages,")
 
     def test_read(self):
         channel = self.create_channel("D3C", "360Dialog channel", address="1234")
-        template1 = Template.objects.create(org=self.org, name="hello")
-
-        TemplateTranslation.objects.create(
-            template=template1,
-            channel=channel,
-            locale="eng-US",
-            status=TemplateTranslation.STATUS_PENDING,
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Hello {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
+        template1 = self.create_template(
+            "hello",
+            [
+                TemplateTranslation(
+                    channel=channel,
+                    locale="eng-US",
+                    status=TemplateTranslation.STATUS_PENDING,
+                    components=[
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Hello {{1}}",
+                            "variables": {"1": 0},
+                            "params": [{"type": "text"}],
+                        }
+                    ],
+                    variables=[{"type": "text"}],
+                ),
+                TemplateTranslation(
+                    channel=channel,
+                    locale="spa",
+                    status=TemplateTranslation.STATUS_APPROVED,
+                    components=[
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Hola {{1}}",
+                            "variables": {"1": 0},
+                            "params": [{"type": "text"}],
+                        }
+                    ],
+                    variables=[{"type": "text"}],
+                    is_supported=False,
+                ),
+                TemplateTranslation(
+                    channel=self.channel,
+                    locale="eng-US",
+                    status=TemplateTranslation.STATUS_REJECTED,
+                    components=[
+                        {
+                            "name": "body",
+                            "type": "body/text",
+                            "content": "Hello {{1}}",
+                            "variables": {"1": 0},
+                            "params": [{"type": "text"}, {"type": "text"}],
+                        }
+                    ],
+                    variables=[{"type": "text"}, {"type": "text"}],
+                ),
             ],
-            variables=[{"type": "text"}],
-        )
-        TemplateTranslation.objects.create(
-            template=template1,
-            channel=channel,
-            locale="spa",
-            status=TemplateTranslation.STATUS_APPROVED,
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Hola {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
-            ],
-            variables=[{"type": "text"}],
-        )
-        TemplateTranslation.objects.create(
-            template=template1,
-            channel=self.channel,
-            locale="eng-US",
-            status=TemplateTranslation.STATUS_REJECTED,
-            components=[
-                {
-                    "name": "body",
-                    "type": "body/text",
-                    "content": "Hello {{1}}",
-                    "variables": {"1": 0},
-                    "params": [{"type": "text"}],
-                }
-            ],
-            variables=[{"type": "text"}],
         )
 
         # create translation for other template
-        template2 = Template.objects.create(org=self.org, name="goodbye")
-        TemplateTranslation.objects.create(
-            template=template2, channel=channel, locale="eng", status=TemplateTranslation.STATUS_PENDING
+        self.create_template(
+            "goodbye", [TemplateTranslation(channel=channel, locale="eng", status=TemplateTranslation.STATUS_PENDING)]
         )
 
         read_url = reverse("templates.template_read", args=[template1.uuid])
@@ -397,41 +453,6 @@ class TemplateCRUDLTest(CRUDLTestMixin, TembaTest):
 
         self.assertContains(response, "Hello <code>{{1}}</code>")
         self.assertContains(response, "Hola <code>{{1}}</code>")
+        self.assertContains(response, "Uses unsupported component types.")
+        self.assertContains(response, "Variable parameters don't match.")
         self.assertNotContains(response, "Goodbye")
-
-
-class RemoveDuplicateTranslationsTest(MigrationTest):
-    app = "templates"
-    migrate_from = "0030_alter_templatetranslation_locale"
-    migrate_to = "0031_remove_duplicate_translations"
-
-    def setUpBeforeMigration(self, apps):
-        channel1 = self.create_channel("D3C", "D3C Channel", address="1234")
-        channel2 = self.create_channel("WAC", "WAC Channel", address="2345")
-
-        template1 = Template.objects.create(org=self.org, name="hello")
-        template2 = Template.objects.create(org=self.org, name="goodbye")
-
-        def create_translation(template, channel, locale):
-            return TemplateTranslation.objects.create(
-                template=template, channel=channel, locale=locale, status=TemplateTranslation.STATUS_PENDING
-            )
-
-        self.should_keep = []
-        self.should_delete = []
-
-        self.should_keep.append(create_translation(template1, channel1, "eng"))
-        self.should_delete.append(create_translation(template1, channel2, "eng"))
-        self.should_keep.append(create_translation(template1, channel2, "eng"))  # duplicate
-        self.should_keep.append(create_translation(template1, channel1, "spa"))
-        self.should_delete.append(create_translation(template1, channel2, "spa"))
-        self.should_delete.append(create_translation(template1, channel2, "spa"))  # duplicate
-        self.should_keep.append(create_translation(template1, channel2, "spa"))  # duplicate
-        self.should_keep.append(create_translation(template2, channel1, "eng"))
-        self.should_keep.append(create_translation(template2, channel2, "eng"))
-
-    def test_migration(self):
-        for trans in self.should_keep:
-            self.assertTrue(TemplateTranslation.objects.filter(id=trans.id).exists())
-        for trans in self.should_delete:
-            self.assertFalse(TemplateTranslation.objects.filter(id=trans.id).exists())

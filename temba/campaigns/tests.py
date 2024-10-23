@@ -4,16 +4,17 @@ from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.files.storage import default_storage
 from django.urls import reverse
 from django.utils import timezone
 
 from temba.campaigns.views import CampaignEventCRUDL
 from temba.contacts.models import ContactField
-from temba.flows.models import Flow, FlowRevision
+from temba.flows.models import Flow
 from temba.msgs.models import Msg
 from temba.orgs.models import DefinitionExport, Org
 from temba.tests import CRUDLTestMixin, MigrationTest, TembaTest, matchers, mock_mailroom
-from temba.utils.views import TEMBA_MENU_SELECTION
+from temba.utils.views.mixins import TEMBA_MENU_SELECTION
 
 from .models import Campaign, CampaignEvent, EventFire
 from .tasks import trim_event_fires
@@ -56,7 +57,7 @@ class CampaignTest(TembaTest):
 
         self.assertEqual("Reminders", campaign.name)
         self.assertEqual("Reminders", str(campaign))
-        self.assertEqual('<Event: relative_to=planting_date offset=1 flow="Test Flow">', repr(event1))
+        self.assertEqual(f'<Event: id={event1.id} relative_to=planting_date offset=1 flow="Test Flow">', repr(event1))
         self.assertEqual([event1, event2], list(campaign.get_events()))
         self.assertEqual(None, event1.get_message(contact))
         self.assertEqual("Hello", event2.get_message(contact))
@@ -158,7 +159,7 @@ class CampaignTest(TembaTest):
         # create a campaign
         campaign = Campaign.create(self.org, self.user, "Planting Reminders", self.farmers)
 
-        flow = self.create_flow("Test")
+        flow = self.create_flow("Test 1")
 
         event1 = CampaignEvent.create_flow_event(
             self.org, self.admin, campaign, self.planting_date, offset=1, unit="W", flow=flow, delivery_hour="13"
@@ -172,22 +173,15 @@ class CampaignTest(TembaTest):
 
         self.assertEqual(campaign.get_sorted_events(), [event2, event1, event3])
 
-        flow_json = self.get_flow_json("favorites")
-        flow = Flow.objects.create(
-            name="Call Me Maybe",
-            org=self.org,
-            is_system=True,
-            created_by=self.admin,
-            modified_by=self.admin,
-            saved_by=self.admin,
-            version_number="13.5.0",
-            flow_type="V",
-        )
-
-        FlowRevision.objects.create(flow=flow, definition=flow_json, spec_version=3, revision=1, created_by=self.admin)
-
         event4 = CampaignEvent.create_flow_event(
-            self.org, self.admin, campaign, self.planting_date, offset=2, unit="W", flow=flow, delivery_hour="5"
+            self.org,
+            self.admin,
+            campaign,
+            self.planting_date,
+            offset=2,
+            unit="W",
+            flow=self.create_flow("Test 2"),
+            delivery_hour="5",
         )
 
         self.assertEqual(campaign.get_sorted_events(), [event2, event1, event3, event4])
@@ -800,7 +794,7 @@ class CampaignTest(TembaTest):
         self.assertIsNotNone(ev4.get_relative_to_value())
 
     def test_import(self):
-        self.import_file("the_clinic")
+        self.import_file("test_flows/the_clinic.json")
         self.assertEqual(1, Campaign.objects.count())
 
         campaign = Campaign.objects.get()
@@ -833,9 +827,7 @@ class CampaignTest(TembaTest):
         export = DefinitionExport.create(self.org, self.admin, flows=[], campaigns=[campaign])
         export.perform()
 
-        filename = f"{settings.MEDIA_ROOT}/test_orgs/{self.org.id}/definition_exports/{export.uuid}.json"
-
-        with open(filename) as export_file:
+        with default_storage.open(f"orgs/{self.org.id}/definition_exports/{export.uuid}.json") as export_file:
             exported = json.loads(export_file.read())
 
         self.org.import_app(exported, self.admin)
@@ -1237,7 +1229,7 @@ class CampaignCRUDLTest(TembaTest, CRUDLTestMixin):
 
         # can't archive campaign from other org
         response = self.client.post(reverse("campaigns.campaign_archive", args=[other_org_campaign.id]))
-        self.assertEqual(404, response.status_code)
+        self.assertEqual(302, response.status_code)
 
         # check object is unchanged
         other_org_campaign.refresh_from_db()

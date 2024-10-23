@@ -155,6 +155,7 @@
                      fields="/api/v2/fields.json"
                      groups="/api/v2/groups.json"
                      workspace="/api/v2/workspace.json"
+                     shortcuts="/api/internal/shortcuts.json"
                      users="/api/v2/users.json">
         </temba-store>
       {% else %}
@@ -183,7 +184,7 @@
                             right:0;
                             bottom:0"
                      class="servicing absolute bg-secondary my-2 mr-20 rounded shadow-xl">
-                  <a href="{% url 'orgs.org_service' %}"
+                  <a href="{% url 'staff.org_service' %}"
                      style="text-decoration:none"
                      onclick="handlePosterizeClick(event)"
                      class="relative">
@@ -240,7 +241,7 @@
                         <div class="line flex-grow mr-2 ml-6">
                           <div class="h-0 border border-gray-200"></div>
                         </div>
-                        {% if has_content_menu %}
+                        {% if has_context_menu %}
                           {% include "spa_page_menu.html" %}
                         {% endif %}
                       </div>

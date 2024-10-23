@@ -5,8 +5,9 @@ from django.http import HttpResponseRedirect
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
-from temba.orgs.views import DependencyDeleteModal, OrgObjPermsMixin, OrgPermsMixin
-from temba.utils.views import ComponentFormMixin, ContentMenuMixin, SpaMixin
+from temba.orgs.views.base import BaseDependencyDeleteModal
+from temba.orgs.views.mixins import OrgObjPermsMixin, OrgPermsMixin
+from temba.utils.views.mixins import ComponentFormMixin, ContextMenuMixin, SpaMixin
 
 from .models import Classifier
 
@@ -14,7 +15,7 @@ from .models import Classifier
 class BaseConnectView(SpaMixin, ComponentFormMixin, OrgPermsMixin, SmartFormView):
     permission = "classifiers.classifier_connect"
     classifier_type = None
-    menu_path = "/settings/workspace"
+    menu_path = "/settings/classifiers/new-classifier"
 
     def __init__(self, classifier_type):
         self.classifier_type = classifier_type
@@ -42,19 +43,19 @@ class ClassifierCRUDL(SmartCRUDL):
     model = Classifier
     actions = ("read", "connect", "delete", "sync")
 
-    class Delete(DependencyDeleteModal):
+    class Delete(BaseDependencyDeleteModal):
         cancel_url = "uuid@classifiers.classifier_read"
         success_url = "@orgs.org_workspace"
         success_message = _("Your classifier has been deleted.")
 
-    class Read(SpaMixin, OrgObjPermsMixin, ContentMenuMixin, SmartReadView):
+    class Read(SpaMixin, OrgObjPermsMixin, ContextMenuMixin, SmartReadView):
         slug_url_kwarg = "uuid"
         exclude = ("id", "is_active", "created_by", "modified_by", "modified_on")
 
         def derive_menu_path(self):
             return f"/settings/classifiers/{self.get_object().uuid}"
 
-        def build_content_menu(self, menu):
+        def build_context_menu(self, menu):
             obj = self.get_object()
 
             menu.add_link(_("Log"), reverse("request_logs.httplog_classifier", args=[obj.uuid]))
@@ -90,7 +91,7 @@ class ClassifierCRUDL(SmartCRUDL):
             return HttpResponseRedirect(self.get_success_url())
 
     class Connect(SpaMixin, OrgPermsMixin, SmartTemplateView):
-        menu_path = "/settings/workspace"
+        menu_path = "/settings/classifiers/new-classifier"
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)

@@ -8,6 +8,7 @@ from smartmin.views import (
     SmartCreateView,
     SmartCRUDL,
     SmartDeleteView,
+    SmartFormView,
     SmartListView,
     SmartReadView,
     SmartTemplateView,
@@ -18,7 +19,7 @@ from django import forms
 from django.conf import settings
 from django.contrib.humanize.templatetags import humanize
 from django.core.exceptions import ValidationError
-from django.db.models import Count, Max, Min, Sum
+from django.db.models import Max, Min, Sum
 from django.db.models.functions import Lower
 from django.http import Http404, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.urls import reverse
@@ -35,15 +36,8 @@ from temba.flows.models import Flow, FlowRevision, FlowRun, FlowSession, FlowSta
 from temba.flows.tasks import update_session_wait_expires
 from temba.ivr.models import Call
 from temba.orgs.models import IntegrationType, Org
-from temba.orgs.views import (
-    BaseExportView,
-    DependencyDeleteModal,
-    MenuMixin,
-    ModalMixin,
-    OrgFilterMixin,
-    OrgObjPermsMixin,
-    OrgPermsMixin,
-)
+from temba.orgs.views.base import BaseDependencyDeleteModal, BaseExportModal, BaseListView, BaseMenuView
+from temba.orgs.views.mixins import BulkActionMixin, OrgObjPermsMixin, OrgPermsMixin
 from temba.triggers.models import Trigger
 from temba.utils import analytics, gettext, json, languages, on_transaction_commit
 from temba.utils.fields import (
@@ -55,7 +49,7 @@ from temba.utils.fields import (
     TembaChoiceField,
 )
 from temba.utils.text import slugify_with
-from temba.utils.views import BulkActionMixin, ContentMenuMixin, SpaMixin, StaffOnlyMixin
+from temba.utils.views.mixins import ContextMenuMixin, ModalFormMixin, SpaMixin, StaffOnlyMixin
 
 from .models import FlowLabel, FlowStartCount, FlowUserConflictException, FlowVersionConflictException, ResultsExport
 
@@ -163,7 +157,7 @@ class FlowRunCRUDL(SmartCRUDL):
     actions = ("delete",)
     model = FlowRun
 
-    class Delete(ModalMixin, OrgObjPermsMixin, SmartDeleteView):
+    class Delete(ModalFormMixin, OrgObjPermsMixin, SmartDeleteView):
         fields = ("id",)
         success_message = None
 
@@ -208,7 +202,7 @@ class FlowCRUDL(SmartCRUDL):
             initial_queryset = super().get_queryset()
             return initial_queryset.filter(is_active=True)
 
-    class Menu(MenuMixin, SmartTemplateView):
+    class Menu(BaseMenuView):
         @classmethod
         def derive_url_pattern(cls, path, action):
             return r"^%s/%s/((?P<submenu>[A-z]+)/)?$" % (path, action)
@@ -223,6 +217,7 @@ class FlowCRUDL(SmartCRUDL):
                     name=_("Archived"),
                     icon="archive",
                     href="flows.flow_archived",
+                    perm="flows.flow_list",
                 )
             )
 
@@ -238,11 +233,16 @@ class FlowCRUDL(SmartCRUDL):
                         menu_id=label.uuid,
                         name=label.name,
                         href=reverse("flows.flow_filter", args=[label.uuid]),
+                        perm="flows.flow_list",
                         count=label.get_flow_count(),
                     )
                 )
 
             history_items = []
+            if self.has_org_perm("flows.flowstart_list"):
+                history_items.append(
+                    self.create_menu_item(menu_id="starts", name=_("Starts"), href=reverse("flows.flowstart_list"))
+                )
             if self.has_org_perm("request_logs.httplog_webhooks"):
                 history_items.append(
                     self.create_menu_item(
@@ -250,19 +250,8 @@ class FlowCRUDL(SmartCRUDL):
                     )
                 )
 
-            if self.has_org_perm("flows.flowstart_list"):
-                history_items.append(
-                    self.create_menu_item(menu_id="starts", name=_("Flow Starts"), href=reverse("flows.flowstart_list"))
-                )
-
             if history_items:
-                menu.append(
-                    self.create_menu_item(
-                        name=_("History"),
-                        items=history_items,
-                        inline=True,
-                    )
-                )
+                menu.append(self.create_menu_item(name=_("History"), items=history_items, inline=True))
 
             if label_items:
                 menu.append(self.create_menu_item(name=_("Labels"), items=label_items, inline=True))
@@ -274,6 +263,7 @@ class FlowCRUDL(SmartCRUDL):
         Used by the editor for the rollover of recent contacts coming out of a split
         """
 
+        permission = "flows.flow_editor"
         slug_url_kwarg = "uuid"
 
         @classmethod
@@ -290,6 +280,7 @@ class FlowCRUDL(SmartCRUDL):
         Used by the editor for fetching and saving flow definitions
         """
 
+        permission = "flows.flow_editor"  # POSTs explicitly check for flows.flow_update
         slug_url_kwarg = "uuid"
 
         @classmethod
@@ -397,7 +388,7 @@ class FlowCRUDL(SmartCRUDL):
 
             return JsonResponse({"status": "failure", "description": error, "detail": detail}, status=400)
 
-    class Create(ModalMixin, OrgPermsMixin, SmartCreateView):
+    class Create(ModalFormMixin, OrgPermsMixin, SmartCreateView):
         class Form(BaseFlowForm):
             keyword_triggers = forms.CharField(
                 required=False,
@@ -421,7 +412,7 @@ class FlowCRUDL(SmartCRUDL):
                 self.fields["flow_type"] = forms.ChoiceField(
                     label=_("Type"),
                     help_text=_("Choose the method for your flow"),
-                    choices=Flow.TYPE_CHOICES if "surveyor" in settings.FEATURES else Flow.TYPE_CHOICES[:3],
+                    choices=Flow.TYPE_CHOICES[:3],  # exclude SURVEY from options
                     widget=SelectWidget(
                         attrs={"widget_only": False},
                         option_attrs={
@@ -491,7 +482,7 @@ class FlowCRUDL(SmartCRUDL):
 
             return obj
 
-    class Delete(DependencyDeleteModal):
+    class Delete(BaseDependencyDeleteModal):
         cancel_url = "uuid@flows.flow_editor"
         success_url = "@flows.flow_list"
 
@@ -504,7 +495,7 @@ class FlowCRUDL(SmartCRUDL):
             # redirect to the newly created flow
             return HttpResponseRedirect(reverse("flows.flow_editor", args=[copy.uuid]))
 
-    class Update(AllowOnlyActiveFlowMixin, ModalMixin, OrgObjPermsMixin, SmartUpdateView):
+    class Update(AllowOnlyActiveFlowMixin, ModalFormMixin, OrgObjPermsMixin, SmartUpdateView):
         class BaseForm(BaseFlowForm):
             class Meta:
                 model = Flow
@@ -675,9 +666,9 @@ class FlowCRUDL(SmartCRUDL):
                         match_type=Trigger.MATCH_FIRST_WORD,
                     )
 
-    class BaseList(SpaMixin, OrgFilterMixin, OrgPermsMixin, BulkActionMixin, ContentMenuMixin, SmartListView):
+    class BaseList(BulkActionMixin, ContextMenuMixin, BaseListView):
+        permission = "flows.flow_list"
         title = _("Flows")
-        refresh = 10000
         fields = ("name", "modified_on")
         default_template = "flows/flow_list.html"
         default_order = ("-saved_on",)
@@ -685,11 +676,6 @@ class FlowCRUDL(SmartCRUDL):
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)
-            context["org_has_flows"] = self.request.org.flows.filter(is_active=True).exists()
-            context["folders"] = self.get_folders()
-            context["labels"] = self.get_flow_labels()
-            context["campaigns"] = self.get_campaigns()
-            context["request_url"] = self.request.path
 
             # decorate flow objects with their run activity stats
             for flow in context["object_list"]:
@@ -700,22 +686,6 @@ class FlowCRUDL(SmartCRUDL):
         def derive_queryset(self, *args, **kwargs):
             qs = super().derive_queryset(*args, **kwargs)
             return qs.exclude(is_system=True).exclude(is_active=False)
-
-        def get_campaigns(self):
-            from temba.campaigns.models import CampaignEvent
-
-            org = self.request.org
-            events = CampaignEvent.objects.filter(
-                campaign__org=org,
-                is_active=True,
-                campaign__is_active=True,
-                flow__is_archived=False,
-                flow__is_active=True,
-                flow__is_system=False,
-            )
-            return (
-                events.values("campaign__name", "campaign__id").annotate(count=Count("id")).order_by("campaign__name")
-            )
 
         def apply_bulk_action(self, user, action, objects, label):
             super().apply_bulk_action(user, action, objects, label)
@@ -730,42 +700,9 @@ class FlowCRUDL(SmartCRUDL):
                     )
 
         def get_bulk_action_labels(self):
-            return self.request.org.flow_labels.filter(is_active=True)
+            return self.request.org.flow_labels.filter(is_active=True).order_by(Lower("name"))
 
-        def get_flow_labels(self):
-            labels = []
-            for label in self.request.org.flow_labels.order_by("name"):
-                labels.append(
-                    {
-                        "id": label.id,
-                        "uuid": label.uuid,
-                        "name": label.name,
-                        "count": label.get_flow_count(),
-                    }
-                )
-            return labels
-
-        def get_folders(self):
-            org = self.request.org
-
-            return [
-                dict(
-                    label="Active",
-                    url=reverse("flows.flow_list"),
-                    count=Flow.objects.exclude(is_system=True)
-                    .filter(is_active=True, is_archived=False, org=org)
-                    .count(),
-                ),
-                dict(
-                    label="Archived",
-                    url=reverse("flows.flow_archived"),
-                    count=Flow.objects.exclude(is_system=True)
-                    .filter(is_active=True, is_archived=True, org=org)
-                    .count(),
-                ),
-            ]
-
-        def build_content_menu(self, menu):
+        def build_context_menu(self, menu):
             if self.has_org_perm("flows.flow_create"):
                 menu.add_modax(
                     _("New Flow"),
@@ -800,7 +737,7 @@ class FlowCRUDL(SmartCRUDL):
 
     class List(BaseList):
         title = _("Active")
-        bulk_actions = ("archive", "label", "download-results")
+        bulk_actions = ("archive", "label", "export-results")
         menu_path = "/flow/active"
 
         def derive_queryset(self, *args, **kwargs):
@@ -810,13 +747,13 @@ class FlowCRUDL(SmartCRUDL):
 
     class Filter(BaseList, OrgObjPermsMixin):
         add_button = True
-        bulk_actions = ("label", "download-results")
+        bulk_actions = ("label", "export-results")
         slug_url_kwarg = "uuid"
 
         def derive_menu_path(self):
             return f"/flow/labels/{self.label.uuid}"
 
-        def build_content_menu(self, menu):
+        def build_context_menu(self, menu):
             if self.has_org_perm("flows.flow_update"):
                 menu.add_modax(
                     _("Edit"),
@@ -857,7 +794,7 @@ class FlowCRUDL(SmartCRUDL):
             qs = super().get_queryset(**kwargs)
             return qs.filter(org=self.request.org, labels=self.label, is_archived=False).order_by("-created_on")
 
-    class Editor(SpaMixin, OrgObjPermsMixin, ContentMenuMixin, SmartReadView):
+    class Editor(SpaMixin, OrgObjPermsMixin, ContextMenuMixin, SmartReadView):
         slug_url_kwarg = "uuid"
 
         def derive_menu_path(self):
@@ -883,7 +820,7 @@ class FlowCRUDL(SmartCRUDL):
                 context["can_start"] = flow.flow_type != Flow.TYPE_VOICE or flow.org.supports_ivr()
                 context["can_simulate"] = True
 
-            context["is_starting"] = flow.is_starting()
+            context["active_start"] = flow.get_active_start()
             context["feature_filters"] = json.dumps(self.get_features(flow.org))
             return context
 
@@ -909,7 +846,7 @@ class FlowCRUDL(SmartCRUDL):
 
             return features
 
-        def build_content_menu(self, menu):
+        def build_context_menu(self, menu):
             obj = self.get_object()
 
             if obj.flow_type != Flow.TYPE_SURVEY and self.has_org_perm("flows.flow_start") and not obj.is_archived:
@@ -953,14 +890,13 @@ class FlowCRUDL(SmartCRUDL):
 
             # limit PO export/import to non-archived flows since mailroom doesn't know about archived flows
             if not obj.is_archived:
-                if self.has_org_perm("flows.flow_export_translation"):
-                    menu.add_modax(
-                        _("Export Translation"),
-                        "export-translation",
-                        reverse("flows.flow_export_translation", args=[obj.id]),
-                    )
+                menu.add_modax(
+                    _("Export Translation"),
+                    "export-translation",
+                    reverse("flows.flow_export_translation", args=[obj.id]),
+                )
 
-                if self.has_org_perm("flows.flow_import_translation"):
+                if self.has_org_perm("flows.flow_update"):
                     menu.add_link(_("Import Translation"), reverse("flows.flow_import_translation", args=[obj.id]))
 
     class ChangeLanguage(OrgObjPermsMixin, SmartUpdateView):
@@ -979,6 +915,7 @@ class FlowCRUDL(SmartCRUDL):
 
                 return data
 
+        permission = "flows.flow_update"
         form_class = Form
         success_url = "uuid@flows.flow_editor"
 
@@ -996,7 +933,7 @@ class FlowCRUDL(SmartCRUDL):
 
             return HttpResponseRedirect(self.get_success_url())
 
-    class ExportTranslation(OrgObjPermsMixin, ModalMixin, SmartUpdateView):
+    class ExportTranslation(ModalFormMixin, OrgObjPermsMixin, SmartUpdateView):
         class Form(forms.Form):
             language = forms.ChoiceField(
                 required=False,
@@ -1011,6 +948,7 @@ class FlowCRUDL(SmartCRUDL):
 
                 self.fields["language"].choices += languages.choices(codes=org.flow_languages)
 
+        permission = "flows.flow_editor"
         form_class = Form
         submit_button_name = _("Export")
         success_url = "@flows.flow_list"
@@ -1020,22 +958,19 @@ class FlowCRUDL(SmartCRUDL):
             kwargs["org"] = self.request.org
             return kwargs
 
+        def get_success_url(self):
+            params = {"flow": self.object.id, "language": self.form.cleaned_data["language"]}
+            return reverse("flows.flow_download_translation") + "?" + urlencode(params, doseq=True)
+
         def form_valid(self, form):
-            params = {"flow": self.object.id, "language": form.cleaned_data["language"]}
-            download_url = reverse("flows.flow_download_translation") + "?" + urlencode(params, doseq=True)
-
-            # if this is an XHR request, we need to return a structured response that it can parse
-            if "HTTP_X_PJAX" in self.request.META:
-                response = self.render_modal_response(form)
-                response["Temba-Success"] = download_url
-                return response
-
-            return HttpResponseRedirect(download_url)
+            return self.render_modal_response(form)
 
     class DownloadTranslation(OrgPermsMixin, SmartListView):
         """
         Download link for PO translation files extracted from flows by mailroom
         """
+
+        permission = "flows.flow_editor"
 
         def get(self, request, *args, **kwargs):
             org = self.request.org
@@ -1105,6 +1040,7 @@ class FlowCRUDL(SmartCRUDL):
 
                 self.fields["language"].choices = languages.choices(codes=lang_codes)
 
+        permission = "flows.flow_update"
         title = _("Import Translation")
         submit_button_name = _("Import")
         success_url = "uuid@flows.flow_editor"
@@ -1162,8 +1098,8 @@ class FlowCRUDL(SmartCRUDL):
         def derive_initial(self):
             return {"language": self.po_info.language_code if self.po_info else ""}
 
-    class ExportResults(BaseExportView):
-        class Form(BaseExportView.Form):
+    class ExportResults(BaseExportModal):
+        class Form(BaseExportModal.Form):
             flows = forms.ModelMultipleChoiceField(
                 Flow.objects.none(), required=True, widget=forms.MultipleHiddenInput()
             )
@@ -1188,6 +1124,7 @@ class FlowCRUDL(SmartCRUDL):
 
                 self.fields["flows"].queryset = Flow.objects.filter(org=org, is_active=True)
 
+        permission = "flows.flow_results"
         form_class = Form
         export_type = ResultsExport
         success_url = "@flows.flow_list"
@@ -1223,6 +1160,8 @@ class FlowCRUDL(SmartCRUDL):
 
         # the min number of responses to show the period charts
         PERIOD_MIN = 0
+
+        permission = "flows.flow_results"
 
         def render_to_response(self, context, **response_kwargs):
             total_responses = 0
@@ -1358,26 +1297,31 @@ class FlowCRUDL(SmartCRUDL):
             )
 
     class ActivityChart(SpaMixin, AllowOnlyActiveFlowMixin, OrgObjPermsMixin, SmartReadView):
-        pass
+        permission = "flows.flow_results"
 
     class CategoryCounts(AllowOnlyActiveFlowMixin, OrgObjPermsMixin, SmartReadView):
+        """
+        Used by the editor for the counts on split exits
+        """
+
+        permission = "flows.flow_editor"
         slug_url_kwarg = "uuid"
 
         def render_to_response(self, context, **response_kwargs):
             return JsonResponse({"counts": self.get_object().get_category_counts()})
 
-    class Results(SpaMixin, AllowOnlyActiveFlowMixin, OrgObjPermsMixin, ContentMenuMixin, SmartReadView):
+    class Results(SpaMixin, AllowOnlyActiveFlowMixin, OrgObjPermsMixin, ContextMenuMixin, SmartReadView):
         slug_url_kwarg = "uuid"
 
-        def build_content_menu(self, menu):
+        def build_context_menu(self, menu):
             obj = self.get_object()
 
-            if self.has_org_perm("flows.flow_export_results"):
+            if self.has_org_perm("flows.flow_results"):
                 menu.add_modax(
-                    _("Download"),
-                    "download-results",
+                    _("Export"),
+                    "export-results",
                     f"{reverse('flows.flow_export_results')}?ids={obj.id}",
-                    title=_("Download Results"),
+                    title=_("Export Results"),
                 )
 
             if self.has_org_perm("flows.flow_editor"):
@@ -1400,15 +1344,21 @@ class FlowCRUDL(SmartCRUDL):
             return context
 
     class Activity(AllowOnlyActiveFlowMixin, OrgObjPermsMixin, SmartReadView):
+        """
+        Used by the editor for the counts on paths between nodes
+        """
+
+        permission = "flows.flow_editor"
         slug_url_kwarg = "uuid"
 
         def get(self, request, *args, **kwargs):
             flow = self.get_object(self.get_queryset())
             (active, visited) = flow.get_activity()
-
-            return JsonResponse(dict(nodes=active, segments=visited, is_starting=flow.is_starting()))
+            return JsonResponse(dict(nodes=active, segments=visited))
 
     class Simulate(OrgObjPermsMixin, SmartReadView):
+        permission = "flows.flow_editor"
+
         @csrf_exempt
         def dispatch(self, *args, **kwargs):
             return super().dispatch(*args, **kwargs)
@@ -1489,10 +1439,6 @@ class FlowCRUDL(SmartCRUDL):
         permission = "flows.flow_start"
 
         blockers = {
-            "already_starting": _(
-                "This flow is already being started - please wait until that process completes before starting "
-                "more contacts."
-            ),
             "no_send_channel": _(
                 'To start this flow you need to <a href="%(link)s">add a channel</a> to your workspace which will allow '
                 "you to send messages to your contacts."
@@ -1501,30 +1447,42 @@ class FlowCRUDL(SmartCRUDL):
                 'To start this flow you need to <a href="%(link)s">add a voice channel</a> to your workspace which will '
                 "allow you to make and receive calls."
             ),
+            "outbox_full": _(
+                "You have too many messages queued in your outbox. Please wait for these messages to send and then try again."
+            ),
+            "too_many_recipients": _(
+                "Your channels cannot send fast enough to reach all of the selected contacts in a reasonable time. "
+                "Select fewer contacts to continue."
+            ),
         }
 
         warnings = {
+            "already_starting": _(
+                "A flow is already starting. To avoid confusion, make sure you are not targeting the same contacts before continuing."
+            ),
             "no_templates": _(
                 "This flow does not use message templates. You may still start this flow but WhatsApp contacts who "
                 "have not sent an incoming message in the last 24 hours may not receive it."
             ),
-            "inactive_threshold": _(
-                "You've selected a lot of contacts! Depending on your channel "
-                "it could take days to reach everybody and could reduce response rates. "
-                "Filter for contacts that have sent a message recently "
-                "to limit your selection to contacts who are more likely to respond."
+            "too_many_recipients": _(
+                "Your channels will likely take over a day to reach all of the selected contacts. Consider "
+                "selecting fewer contacts before continuing."
             ),
         }
 
-        def get_blockers(self, flow) -> list:
+        def get_blockers(self, flow, send_time) -> list:
             blockers = []
 
+            if flow.org.is_outbox_full():
+                blockers.append(self.blockers["outbox_full"])
             if flow.org.is_suspended:
                 blockers.append(Org.BLOCKER_SUSPENDED)
             elif flow.org.is_flagged:
                 blockers.append(Org.BLOCKER_FLAGGED)
-            elif flow.is_starting():
-                blockers.append(self.blockers["already_starting"])
+
+            hours = send_time / timedelta(hours=1)
+            if settings.SEND_HOURS_BLOCK and hours >= settings.SEND_HOURS_BLOCK:
+                blockers.append(self.blockers["too_many_recipients"])
 
             if flow.flow_type == Flow.TYPE_MESSAGE and not flow.org.get_send_channel():
                 blockers.append(self.blockers["no_send_channel"] % {"link": reverse("channels.channel_claim")})
@@ -1533,13 +1491,11 @@ class FlowCRUDL(SmartCRUDL):
 
             return blockers
 
-        def get_warnings(self, flow, query, total) -> list:
+        def get_warnings(self, flow, query, send_time) -> list:
             warnings = []
-
-            # if we are over our threshold, show the amount warning
-            threshold = self.request.branding.get("inactive_threshold", 0)
-            if "last_seen_on" not in query and threshold > 0 and total > threshold:
-                warnings.append(self.warnings["inactive_threshold"])
+            hours = send_time / timedelta(hours=1)
+            if settings.SEND_HOURS_WARNING and hours >= settings.SEND_HOURS_WARNING:
+                warnings.append(self.warnings["too_many_recipients"])
 
             # if we have a whatsapp channel that requires a message template; exclude twilio whatsApp
             whatsapp_channel = flow.org.channels.filter(
@@ -1560,6 +1516,10 @@ class FlowCRUDL(SmartCRUDL):
                         )
                     elif not template.is_approved():
                         warnings.append(_(f"Your message template {template.name} is not approved and cannot be sent."))
+
+            if FlowStart.has_unfinished(flow.org):
+                warnings.append(self.warnings["already_starting"])
+
             return warnings
 
         def post(self, request, *args, **kwargs):
@@ -1568,21 +1528,28 @@ class FlowCRUDL(SmartCRUDL):
             exclude = mailroom.Exclusions(**payload.get("exclude", {}))
             flow = self.get_object()
 
+            if flow and flow.flow_type == Flow.TYPE_BACKGROUND:
+                exclude.in_a_flow = False
+
             try:
                 query, total = FlowStart.preview(flow, include=include, exclude=exclude)
             except mailroom.QueryValidationException as e:
                 return JsonResponse({"query": "", "total": 0, "error": str(e)}, status=400)
 
+            # calculate the estimated send time
+            send_time = flow.org.get_estimated_send_time(total)
+
             return JsonResponse(
                 {
                     "query": query,
                     "total": total,
-                    "warnings": self.get_warnings(flow, query, total),
-                    "blockers": self.get_blockers(flow),
+                    "warnings": self.get_warnings(flow, query, send_time),
+                    "blockers": self.get_blockers(flow, send_time),
+                    "send_time": send_time.total_seconds(),
                 }
             )
 
-    class Start(OrgPermsMixin, ModalMixin):
+    class Start(ModalFormMixin, OrgPermsMixin, SmartFormView):
         class Form(forms.ModelForm):
             flow = TembaChoiceField(
                 queryset=Flow.objects.none(),
@@ -1594,7 +1561,12 @@ class FlowCRUDL(SmartCRUDL):
 
             contact_search = forms.JSONField(
                 required=True,
-                widget=ContactSearchWidget(attrs={"widget_only": True, "placeholder": _("Enter contact query")}),
+                widget=ContactSearchWidget(
+                    attrs={
+                        "widget_only": True,
+                        "placeholder": _("Enter contact query"),
+                    }
+                ),
             )
 
             def __init__(self, org, flow, **kwargs):
@@ -1661,8 +1633,18 @@ class FlowCRUDL(SmartCRUDL):
                     urn = urn.get_display(org=org, international=True)
                 recipients.append({"id": contact.uuid, "name": contact.name, "urn": urn, "type": "contact"})
 
+            exclusions = settings.DEFAULT_EXCLUSIONS.copy()
+
+            if self.flow and self.flow.flow_type == Flow.TYPE_BACKGROUND:
+                del exclusions["in_a_flow"]
+
             return {
-                "contact_search": {"recipients": recipients, "advanced": False, "query": "", "exclusions": {}},
+                "contact_search": {
+                    "recipients": recipients,
+                    "advanced": False,
+                    "query": "",
+                    "exclusions": exclusions,
+                },
                 "flow": self.flow.id if self.flow else None,
             }
 
@@ -1683,14 +1665,13 @@ class FlowCRUDL(SmartCRUDL):
             analytics.track(self.request.user, "temba.flow_start", contact_search)
 
             recipients = contact_search.get("recipients", [])
-            contact_uuids = [_.get("id") for _ in recipients if _.get("type") == "contact"]
-            group_uuids = [_.get("id") for _ in recipients if _.get("type") == "group"]
+            groups, contacts = ContactSearchWidget.parse_recipients(self.request.org, recipients)
 
             # queue the flow start to be started by mailroom
             flow.async_start(
                 self.request.user,
-                groups=(self.request.org.groups.filter(uuid__in=group_uuids)),
-                contacts=(self.request.org.contacts.filter(uuid__in=contact_uuids)),
+                groups=groups,
+                contacts=contacts,
                 query=contact_search["parsed_query"] if "parsed_query" in contact_search else None,
                 exclusions=contact_search.get("exclusions", {}),
             )
@@ -1754,7 +1735,7 @@ class FlowLabelCRUDL(SmartCRUDL):
     model = FlowLabel
     actions = ("create", "update", "delete")
 
-    class Delete(ModalMixin, OrgObjPermsMixin, SmartDeleteView):
+    class Delete(ModalFormMixin, OrgObjPermsMixin, SmartDeleteView):
         fields = ("uuid",)
         success_url = "@flows.flow_list"
         cancel_url = "@flows.flow_list"
@@ -1768,7 +1749,7 @@ class FlowLabelCRUDL(SmartCRUDL):
             self.object.delete()
             return self.render_modal_response()
 
-    class Update(ModalMixin, OrgObjPermsMixin, SmartUpdateView):
+    class Update(ModalFormMixin, OrgObjPermsMixin, SmartUpdateView):
         form_class = FlowLabelForm
         success_url = "uuid@flows.flow_filter"
 
@@ -1777,7 +1758,7 @@ class FlowLabelCRUDL(SmartCRUDL):
             kwargs["org"] = self.request.org
             return kwargs
 
-    class Create(ModalMixin, OrgPermsMixin, SmartCreateView):
+    class Create(ModalFormMixin, OrgPermsMixin, SmartCreateView):
         fields = ("name", "flows")
         form_class = FlowLabelForm
         submit_button_name = _("Create")
@@ -1809,9 +1790,9 @@ class FlowLabelCRUDL(SmartCRUDL):
 
 class FlowStartCRUDL(SmartCRUDL):
     model = FlowStart
-    actions = ("list",)
+    actions = ("list", "interrupt", "status")
 
-    class List(SpaMixin, OrgFilterMixin, OrgPermsMixin, SmartListView):
+    class List(BaseListView):
         title = _("Flow Starts")
         ordering = ("-created_on",)
         select_related = ("flow", "created_by")
@@ -1841,3 +1822,52 @@ class FlowStartCRUDL(SmartCRUDL):
             FlowStartCount.bulk_annotate(context["object_list"])
 
             return context
+
+    class Status(OrgPermsMixin, SmartListView):
+        permission = "flows.flowstart_list"
+
+        def derive_queryset(self, **kwargs):
+            qs = super().derive_queryset(**kwargs)
+            id = self.request.GET.get("id", None)
+            if id:
+                qs = qs.filter(id=id)
+
+            status = self.request.GET.get("status", None)
+            if status:
+                qs = qs.filter(status=status)
+
+            return qs.order_by("-created_on")
+
+        def render_to_response(self, context, **response_kwargs):
+            # add run count
+            FlowStartCount.bulk_annotate(context["object_list"])
+
+            results = []
+            for obj in context["object_list"]:
+                # created_on as an iso date
+                results.append(
+                    {
+                        "id": obj.id,
+                        "status": obj.get_status_display(),
+                        "created_on": obj.created_on.isoformat(),
+                        "modified_on": obj.modified_on.isoformat(),
+                        "flow": {
+                            "name": obj.flow.name,
+                            "uuid": obj.flow.uuid,
+                        },
+                        "progress": {"total": obj.contact_count, "current": obj.run_count},
+                    }
+                )
+            return JsonResponse({"results": results})
+
+    class Interrupt(ModalFormMixin, OrgObjPermsMixin, SmartUpdateView):
+        default_template = "smartmin/delete_confirm.html"
+        permission = "flows.flowstart_update"
+        fields = ()
+        submit_button_name = _("Interrupt")
+        success_url = "@flows.flowstart_list"
+
+        def post(self, request, *args, **kwargs):
+            flow_start = self.get_object()
+            flow_start.interrupt(self.request.user)
+            return super().post(request, *args, **kwargs)

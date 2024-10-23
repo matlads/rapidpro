@@ -5,7 +5,7 @@ from django.utils import timezone
 
 from temba.request_logs.models import HTTPLog
 from temba.tests import CRUDLTestMixin, MockResponse, TembaTest
-from temba.utils.views import TEMBA_MENU_SELECTION
+from temba.utils.views.mixins import TEMBA_MENU_SELECTION
 
 from .models import Classifier
 from .types.luis import LuisType
@@ -105,10 +105,12 @@ class ClassifierCRUDLTest(TembaTest, CRUDLTestMixin):
     def test_views(self):
         # fetch workspace menu
         self.login(self.admin)
+
+        # no menu on main settings
         self.assertContentMenu(
             reverse("orgs.org_workspace"),
             self.admin,
-            ["New Channel", "New Classifier", "-", "Export", "Import"],
+            [],
         )
 
         read_url = reverse("classifiers.classifier_read", args=[self.c1.uuid])

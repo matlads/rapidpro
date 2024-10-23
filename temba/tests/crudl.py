@@ -184,11 +184,12 @@ class CRUDLTestMixin:
 
         self.assertEqual(items, actual)
 
-    def assertContentMenu(self, url: str, user, items: list):
+    def assertContentMenu(self, url: str, user, items: list, choose_org=None):
         response = self.requestView(
             url,
             user,
             checks=[StatusCode(200), ContentType("application/json")],
+            choose_org=choose_org,
             HTTP_TEMBA_CONTENT_MENU=1,
             HTTP_TEMBA_SPA=1,
         )
@@ -383,7 +384,7 @@ class ContentType(BaseCheck):
 
 class StaffRedirect(BaseCheck):
     def check(self, test_cls, response, msg_prefix):
-        test_cls.assertRedirect(response, reverse("orgs.org_service"), msg=f"{msg_prefix}: expected staff redirect")
+        test_cls.assertRedirect(response, reverse("staff.org_service"), msg=f"{msg_prefix}: expected staff redirect")
 
 
 class LoginRedirectOr404(BaseCheck):

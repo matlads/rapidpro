@@ -1,14 +1,12 @@
-import uuid
-
 from django.db import models
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from temba.channels.models import Channel
 from temba.orgs.models import DependencyMixin, Org
 from temba.utils.languages import alpha2_to_alpha3
-from temba.utils.models import update_if_changed
+from temba.utils.models import TembaModel, update_if_changed
 
 
 class TemplateType:
@@ -33,30 +31,23 @@ class TemplateType:
         return f"{language}-{country}" if country else language
 
 
-class Template(models.Model, DependencyMixin):
+class Template(TembaModel, DependencyMixin):
     """
     Templates represent messages that can be used in flows and have template variables substituted into them. These
     are currently only used for WhatsApp channels.
     """
 
-    # the uuid for this template
-    uuid = models.UUIDField(default=uuid.uuid4)
-
-    # the name of this template
-    name = models.CharField(max_length=512)
-
-    # the organization this template is used in
     org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="templates")
-
-    # when this template was last modified
-    modified_on = models.DateTimeField(default=timezone.now)
-
-    # when this template was created
-    created_on = models.DateTimeField(default=timezone.now)
+    name = models.CharField(max_length=512)  # overridden to be longer
+    base_translation = models.OneToOneField(
+        "templates.TemplateTranslation", on_delete=models.PROTECT, related_name="base_template", null=True
+    )
 
     @classmethod
     def get_or_create(cls, org, name: str):
-        obj, created = cls.objects.get_or_create(org=org, name=name)
+        obj, created = cls.objects.get_or_create(
+            org=org, name=name, defaults={"created_by": org.created_by, "modified_by": org.created_by}
+        )
         return obj
 
     def is_approved(self):
@@ -78,9 +69,41 @@ class Template(models.Model, DependencyMixin):
         qs = super().annotate_usage(queryset)
 
         return qs.annotate(
-            translation_count=Count("translations", filter=Q(translations__is_active=True)),
-            channel_count=Count("translations__channel", filter=Q(translations__is_active=True), distinct=True),
+            locale_count=Count("translations__locale", distinct=True),
+            channel_count=Count("translations__channel", distinct=True),
         )
+
+    def update_base(self, exclude=None):
+        """
+        Tries to set a new base translation for this template from its available translations.
+        """
+        candidates = self.translations.exclude(id=exclude.id) if exclude else self.translations.all()
+
+        # try to find one in the org's primary language
+        new_base = candidates.filter(locale__startswith=self.org.flow_languages[0]).first()
+        if not new_base:
+            # if not fallback to oldest
+            new_base = candidates.order_by("id").first()
+
+        if self.base_translation != new_base:
+            self.base_translation = new_base
+            self.modified_on = timezone.now()
+            self.save(update_fields=("base_translation", "modified_on"))
+
+            self.rebase()
+
+    def rebase(self):
+        if self.base_translation:
+            self.base_translation.refresh_from_db()
+
+        # update translations compatibility with the base variable list
+        for trans in self.translations.all():
+            trans.is_compatible = trans.variables == self.variables
+            trans.save(update_fields=("is_compatible",))
+
+    @property
+    def variables(self):
+        return self.base_translation.variables if self.base_translation else []
 
     class Meta:
         unique_together = ("org", "name")
@@ -91,15 +114,19 @@ class TemplateTranslation(models.Model):
     TemplateTranslation represents a translation for a template and channel pair.
     """
 
-    STATUS_APPROVED = "A"
     STATUS_PENDING = "P"
+    STATUS_APPROVED = "A"
     STATUS_REJECTED = "R"
-    STATUS_UNSUPPORTED = "X"
+    STATUS_PAUSED = "U"
+    STATUS_DISABLED = "D"
+    STATUS_IN_APPEAL = "I"
     STATUS_CHOICES = (
-        (STATUS_APPROVED, _("Approved")),
         (STATUS_PENDING, _("Pending")),
+        (STATUS_APPROVED, _("Approved")),
         (STATUS_REJECTED, _("Rejected")),
-        (STATUS_UNSUPPORTED, _("Unsupported")),
+        (STATUS_PAUSED, _("Paused")),
+        (STATUS_DISABLED, _("Disabled")),
+        (STATUS_IN_APPEAL, _("In Appeal")),
     )
 
     template = models.ForeignKey(Template, on_delete=models.PROTECT, related_name="translations")
@@ -108,11 +135,12 @@ class TemplateTranslation(models.Model):
 
     components = models.JSONField(default=list)
     variables = models.JSONField(default=list)
-    status = models.CharField(max_length=1, choices=STATUS_CHOICES, default=STATUS_PENDING, null=False)
+    status = models.CharField(max_length=1, choices=STATUS_CHOICES, default=STATUS_PENDING)
     namespace = models.CharField(max_length=36, default="")
     external_id = models.CharField(null=True, max_length=64)
     external_locale = models.CharField(null=True, max_length=6)  # e.g. en_US
-    is_active = models.BooleanField(default=True)
+    is_supported = models.BooleanField(default=True)  # whether all components are supported
+    is_compatible = models.BooleanField(default=True)  # whether parameters match those of template base translation
 
     @classmethod
     def update_local(cls, channel, raw_templates: list):
@@ -120,18 +148,23 @@ class TemplateTranslation(models.Model):
         Updates the local translations against the fetched raw templates from the given channel
         """
 
-        refreshed = []
+        seen_ids = []
+        templates = set()
+
         for raw_template in raw_templates:
             translation = channel.template_type.update_local(channel, raw_template)
-
             if translation:
-                refreshed.append(translation)
+                seen_ids.append(translation.id)
+                templates.add(translation.template)
 
         # delete any template translations we didn't see
-        channel.template_translations.exclude(id__in=[tt.id for tt in refreshed]).delete()
+        for gone in channel.template_translations.exclude(id__in=seen_ids):
+            gone.delete()
 
-        # TODO remove this once inactive translations are all hard deleted
-        cls.objects.filter(channel=channel, id__in=[tc.id for tc in refreshed], is_active=False).update(is_active=True)
+        # if any templates don't have a base translation update them
+        for template in templates:
+            if not template.base_translation:
+                template.update_base()
 
     @classmethod
     def get_or_create(
@@ -146,6 +179,7 @@ class TemplateTranslation(models.Model):
         namespace: str,
         components: list,
         variables: list,
+        is_supported: bool,
     ):
         # get the template with this name
         template = Template.get_or_create(channel.org, name)
@@ -163,6 +197,8 @@ class TemplateTranslation(models.Model):
                 namespace=namespace,
                 external_id=external_id,
                 external_locale=external_locale,
+                is_supported=is_supported,
+                is_compatible=existing.is_base() or template.variables == variables,
             )
         else:
             # create new translation
@@ -176,6 +212,8 @@ class TemplateTranslation(models.Model):
                 namespace=namespace,
                 external_id=external_id,
                 external_locale=external_locale,
+                is_supported=is_supported,
+                is_compatible=template.variables == variables,
             )
             changed = True
 
@@ -184,7 +222,28 @@ class TemplateTranslation(models.Model):
             existing.template.modified_on = timezone.now()
             existing.template.save(update_fields=("modified_on",))
 
+            if existing.is_base():
+                existing.template.rebase()
+
         return existing
+
+    def is_base(self):
+        return self.template.base_translation == self
+
+    def delete(self):
+        """
+        Overriden so that if this translation is the base translation for a template, we find a new base for that template
+        """
+
+        try:
+            self.base_template.update_base(exclude=self)
+        except Template.DoesNotExist:
+            pass
+
+        super().delete()
+
+    def __repr__(self):  # pragma: no cover
+        return f'<TemplateTranslation: id={self.id} channel="{self.channel.name}" locale="{self.locale}">'
 
     class Meta:
         constraints = [

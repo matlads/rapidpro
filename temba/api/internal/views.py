@@ -8,6 +8,7 @@ from temba.channels.models import Channel
 from temba.locations.models import AdminBoundary
 from temba.notifications.models import Notification
 from temba.templates.models import Template, TemplateTranslation
+from temba.tickets.models import Shortcut
 
 from ..models import APIPermission, SSLPermission
 from ..support import APISessionAuthentication, CreatedOnCursorPagination, ModifiedOnCursorPagination
@@ -61,7 +62,7 @@ class LocationsEndpoint(ListAPIMixin, BaseEndpoint):
         )
 
         if query:
-            qs = qs.filter(Q(name__icontains=query) | Q(aliases__org=org, aliases__name__icontains=query))
+            qs = qs.filter(Q(path__icontains=query))
 
         return qs.only("osm_id", "name", "path")
 
@@ -85,6 +86,12 @@ class NotificationsEndpoint(ListAPIMixin, BaseEndpoint):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class ShortcutsEndpoint(ListAPIMixin, BaseEndpoint):
+    model = Shortcut
+    serializer_class = serializers.ShortcutReadSerializer
+    pagination_class = ModifiedOnCursorPagination
+
+
 class TemplatesEndpoint(ListAPIMixin, BaseEndpoint):
     """
     WhatsApp templates with their translations.
@@ -97,7 +104,7 @@ class TemplatesEndpoint(ListAPIMixin, BaseEndpoint):
     def filter_queryset(self, queryset):
         org = self.request.org
         queryset = org.templates.exclude(translations=None).prefetch_related(
-            Prefetch("translations", TemplateTranslation.objects.filter(is_active=True).order_by("locale")),
+            Prefetch("translations", TemplateTranslation.objects.order_by("locale")),
             Prefetch("translations__channel", Channel.objects.only("uuid", "name")),
         )
-        return self.filter_before_after(queryset, "modified_on")
+        return self.filter_before_after(queryset, "modified_on").select_related("base_translation__channel")

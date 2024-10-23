@@ -12,7 +12,7 @@ from django.conf import settings
 from django.contrib.auth.models import Group
 from django.core import mail
 from django.core.files.storage import default_storage
-from django.db.models import Model
+from django.db.models import F, Model
 from django.test.utils import override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -24,15 +24,7 @@ from temba.campaigns.models import Campaign, CampaignEvent, EventFire
 from temba.channels.models import Channel, ChannelLog, SyncEvent
 from temba.classifiers.models import Classifier
 from temba.classifiers.types.wit import WitType
-from temba.contacts.models import (
-    URN,
-    Contact,
-    ContactExport,
-    ContactField,
-    ContactGroup,
-    ContactImport,
-    ContactImportBatch,
-)
+from temba.contacts.models import URN, ContactExport, ContactField, ContactGroup, ContactImport, ContactImportBatch
 from temba.flows.models import Flow, FlowLabel, FlowRun, FlowSession, FlowStart, FlowStartCount, ResultsExport
 from temba.globals.models import Global
 from temba.locations.models import AdminBoundary
@@ -44,12 +36,10 @@ from temba.schedules.models import Schedule
 from temba.templates.models import TemplateTranslation
 from temba.tests import CRUDLTestMixin, TembaTest, matchers, mock_mailroom
 from temba.tests.base import get_contact_search
-from temba.tests.s3 import MockS3Client, jsonlgz_encode
 from temba.tickets.models import TicketExport
 from temba.triggers.models import Trigger
 from temba.utils import json, languages
 from temba.utils.uuid import uuid4
-from temba.utils.views import TEMBA_MENU_SELECTION
 
 from .context_processors import RolePermsWrapper
 from .models import (
@@ -94,22 +84,22 @@ class OrgContextProcessorTest(TembaTest):
         self.assertTrue(perms["msgs"]["msg_list"])
         self.assertTrue(perms["contacts"]["contact_update"])
         self.assertTrue(perms["orgs"]["org_country"])
-        self.assertTrue(perms["orgs"]["org_manage_accounts"])
-        self.assertTrue(perms["orgs"]["org_delete_child"])
+        self.assertTrue(perms["orgs"]["user_list"])
+        self.assertTrue(perms["orgs"]["org_delete"])
 
         perms = RolePermsWrapper(OrgRole.EDITOR)
 
         self.assertTrue(perms["msgs"]["msg_list"])
         self.assertTrue(perms["contacts"]["contact_update"])
-        self.assertFalse(perms["orgs"]["org_manage_accounts"])
-        self.assertFalse(perms["orgs"]["org_delete_child"])
+        self.assertFalse(perms["orgs"]["user_list"])
+        self.assertFalse(perms["orgs"]["org_delete"])
 
         perms = RolePermsWrapper(OrgRole.VIEWER)
 
         self.assertTrue(perms["msgs"]["msg_list"])
         self.assertFalse(perms["contacts"]["contact_update"])
-        self.assertFalse(perms["orgs"]["org_manage_accounts"])
-        self.assertFalse(perms["orgs"]["org_delete_child"])
+        self.assertFalse(perms["orgs"]["user_list"])
+        self.assertFalse(perms["orgs"]["org_delete"])
 
         self.assertFalse(perms["msgs"]["foo"])  # no blow up if perm doesn't exist
         self.assertFalse(perms["chickens"]["foo"])  # or app doesn't exist
@@ -120,13 +110,7 @@ class OrgContextProcessorTest(TembaTest):
 
 class InvitationTest(TembaTest):
     def test_model(self):
-        invitation = Invitation.objects.create(
-            org=self.org,
-            user_group="E",
-            email="invitededitor@nyaruka.com",
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
+        invitation = Invitation.create(self.org, self.admin, "invitededitor@nyaruka.com", OrgRole.EDITOR)
 
         self.assertEqual(OrgRole.EDITOR, invitation.role)
 
@@ -137,14 +121,16 @@ class InvitationTest(TembaTest):
         self.assertEqual("RapidPro Invitation", mail.outbox[0].subject)
         self.assertIn(f"https://app.rapidpro.io/org/join/{invitation.secret}/", mail.outbox[0].body)
 
-        invitation.release()
+        user = User.create("invitededitor@nyaruka.com", "Bob", "", "Qwerty123", "en-US")
+        invitation.accept(user)
 
+        self.assertEqual(1, self.admin.notifications.count())
         self.assertFalse(invitation.is_active)
 
     def test_expire_task(self):
         invitation1 = Invitation.objects.create(
             org=self.org,
-            user_group="E",
+            role_code="E",
             email="neweditor@nyaruka.com",
             created_by=self.admin,
             created_on=timezone.now() - timedelta(days=31),
@@ -152,7 +138,7 @@ class InvitationTest(TembaTest):
         )
         invitation2 = Invitation.objects.create(
             org=self.org,
-            user_group="T",
+            role_code="T",
             email="newagent@nyaruka.com",
             created_by=self.admin,
             created_on=timezone.now() - timedelta(days=29),
@@ -197,8 +183,6 @@ class UserTest(TembaTest):
         self.assertFalse(user.is_beta)
         self.assertEqual({"email": "jim@rapidpro.io", "name": "Jim McFlow"}, user.as_engine_ref())
         self.assertEqual([self.org, self.org2], list(user.get_orgs().order_by("id")))
-        self.assertEqual(40, len(user.get_api_token(self.org)))
-        self.assertIsNone(user.get_api_token(self.org2))  # can't generate API token as agent
 
         user.last_name = ""
         user.save(update_fields=("last_name",))
@@ -634,49 +618,14 @@ class UserTest(TembaTest):
         response = self.client.post(confirm_url, {"password": "Qwerty123"})
         self.assertRedirect(response, "/msg/")
 
-    def test_ui_permissions(self):
-        # non-logged in users can't go here
-        response = self.client.get(reverse("orgs.user_list"))
-        self.assertRedirect(response, "/users/login/")
-        response = self.client.post(reverse("orgs.user_delete", args=(self.editor.pk,)), dict(delete=True))
-        self.assertRedirect(response, "/users/login/")
+    @mock_mailroom
+    def test_release(self, mr_mocks):
+        token = APIToken.create(self.org, self.admin)
 
-        # either can admins
-        self.login(self.admin)
-        response = self.client.get(reverse("orgs.user_list"))
-        self.assertRedirect(response, "/users/login/")
-        response = self.client.post(reverse("orgs.user_delete", args=(self.editor.pk,)), dict(delete=True))
-        self.assertRedirect(response, "/users/login/")
-
-        self.editor.refresh_from_db()
-        self.assertTrue(self.editor.is_active)
-
-    def test_ui_management(self):
-        # only customer support gets in on this sweet action
-        self.login(self.customer_support)
-
-        # one of our users should belong to a bunch of orgs
-        for i in range(5):
-            org = Org.objects.create(
-                name=f"Org {i}", timezone=ZoneInfo("Africa/Kigali"), created_by=self.user, modified_by=self.user
-            )
-            org.add_user(self.admin, OrgRole.ADMINISTRATOR)
-
-        response = self.client.get(reverse("orgs.user_list"))
-        self.assertEqual(200, response.status_code)
-
-        response = self.client.post(reverse("orgs.user_delete", args=(self.editor.pk,)), {"delete": True})
-        self.assertEqual(reverse("orgs.user_list"), response["Temba-Success"])
-
-        self.editor.refresh_from_db()
-        self.assertFalse(self.editor.is_active)
-
-    def test_release(self):
         # admin doesn't "own" any orgs
         self.assertEqual(0, len(self.admin.get_owned_orgs()))
 
         # release all but our admin
-        self.surveyor.release(self.customer_support)
         self.editor.release(self.customer_support)
         self.user.release(self.customer_support)
         self.agent.release(self.customer_support)
@@ -693,6 +642,9 @@ class UserTest(TembaTest):
         self.org.refresh_from_db()
         self.assertFalse(self.org.is_active)
 
+        token.refresh_from_db()
+        self.assertFalse(token.is_active)
+
 
 class OrgTest(TembaTest):
     def test_create(self):
@@ -704,7 +656,7 @@ class OrgTest(TembaTest):
         self.assertEqual("D", new_org.date_format)
         self.assertEqual(str(new_org.timezone), "Africa/Kigali")
         self.assertIn(self.admin, self.org.get_admins())
-        self.assertEqual('<Org: name="Cool Stuff">', repr(new_org))
+        self.assertEqual(f'<Org: id={new_org.id} name="Cool Stuff">', repr(new_org))
 
         # if timezone is US, should get MMDDYYYY dates
         new_org = Org.create(self.admin, "Cool Stuff", ZoneInfo("America/Los_Angeles"))
@@ -738,31 +690,6 @@ class OrgTest(TembaTest):
         self.assertEqual([self.admin, admin3], list(self.org.get_admins().order_by("id")))
         self.assertEqual([self.admin, self.admin2], list(self.org2.get_admins().order_by("id")))
 
-    def test_get_allowed_user_roles(self):
-        # show viewer and surveyor because org already has users with those roles
-        self.assertEqual(
-            [OrgRole.ADMINISTRATOR, OrgRole.EDITOR, OrgRole.VIEWER, OrgRole.AGENT, OrgRole.SURVEYOR],
-            self.org.get_allowed_user_roles(),
-        )
-
-        self.user.release(self.customer_support)
-        self.surveyor.release(self.customer_support)
-
-        # should lose viewer and surveyor because org doesn't have those features
-        self.assertEqual(
-            [OrgRole.ADMINISTRATOR, OrgRole.EDITOR, OrgRole.AGENT],
-            self.org.get_allowed_user_roles(),
-        )
-
-        self.org.features = [Org.FEATURE_VIEWERS]
-        self.org.save(update_fields=("features",))
-
-        with self.settings(FEATURES=["surveyor"]):
-            self.assertEqual(
-                [OrgRole.ADMINISTRATOR, OrgRole.EDITOR, OrgRole.VIEWER, OrgRole.AGENT, OrgRole.SURVEYOR],
-                self.org.get_allowed_user_roles(),
-            )
-
     def test_get_owner(self):
         self.org.created_by = self.user
         self.org.save(update_fields=("created_by",))
@@ -778,7 +705,6 @@ class OrgTest(TembaTest):
         OrgMembership.objects.filter(org=self.org, role_code=OrgRole.EDITOR.code).delete()
         OrgMembership.objects.filter(org=self.org, role_code=OrgRole.VIEWER.code).delete()
         OrgMembership.objects.filter(org=self.org, role_code=OrgRole.AGENT.code).delete()
-        OrgMembership.objects.filter(org=self.org, role_code=OrgRole.SURVEYOR.code).delete()
 
         # finally defaulting to org creator
         self.assertEqual(self.user, self.org.get_owner())
@@ -1005,16 +931,16 @@ class OrgTest(TembaTest):
 
         response = self.client.get(settings_url)
         self.assertContains(response, "Prometheus")
-        self.assertContains(response, "Enable Prometheus")
+        self.assertContains(response, "Enable")
 
         # enable it
         prometheus_url = reverse("orgs.org_prometheus")
         response = self.client.post(prometheus_url, {}, follow=True)
-        self.assertContains(response, "Disable Prometheus")
+        self.assertContains(response, "Disable")
 
-        # make sure our API token exists
-        prometheus_group = Group.objects.get(name="Prometheus")
-        self.assertTrue(APIToken.objects.filter(org=self.org, role=prometheus_group, is_active=True))
+        # make sure our token is set
+        self.org.refresh_from_db()
+        self.assertIsNotNone(self.org.prometheus_token)
 
         # other admin sees it enabled too
         self.other_admin = self.create_user("other_admin@nyaruka.com")
@@ -1023,12 +949,14 @@ class OrgTest(TembaTest):
 
         response = self.client.get(settings_url)
         self.assertContains(response, "Prometheus")
-        self.assertContains(response, "Disable Prometheus")
+        self.assertContains(response, "Disable")
 
         # now disable it
         response = self.client.post(prometheus_url, {}, follow=True)
-        self.assertFalse(APIToken.objects.filter(org=self.org, role=prometheus_group, is_active=True))
-        self.assertContains(response, "Enable Prometheus")
+        self.assertContains(response, "Enable")
+
+        self.org.refresh_from_db()
+        self.assertIsNone(self.org.prometheus_token)
 
     def test_resthooks(self):
         resthook_url = reverse("orgs.org_resthooks")
@@ -1168,11 +1096,6 @@ class OrgTest(TembaTest):
 
 
 class OrgDeleteTest(TembaTest):
-    def setUp(self):
-        super().setUp()
-
-        self.mock_s3 = MockS3Client()
-
     def create_content(self, org, user) -> list:
         # add child workspaces
         org.features = [Org.FEATURE_CHILD_ORGS]
@@ -1307,19 +1230,22 @@ class OrgDeleteTest(TembaTest):
 
         add(WebHookEvent.objects.create(org=org, resthook=resthook, data={}))
 
-        template_trans1 = TemplateTranslation.get_or_create(
-            channels[0],
-            "hello",
-            locale="eng-US",
-            status=TemplateTranslation.STATUS_APPROVED,
-            external_id="1234",
-            external_locale="en_US",
-            namespace="foo_namespace",
-            components=[{"name": "body", "type": "body/text", "content": "Hello", "variables": {}, "params": []}],
-            variables=[],
+        template = add(
+            self.create_template(
+                "hello",
+                [
+                    TemplateTranslation(
+                        channel=channels[0],
+                        locale="eng-US",
+                        status=TemplateTranslation.STATUS_APPROVED,
+                        external_id="1234",
+                        external_locale="en_US",
+                    )
+                ],
+                org=org,
+            )
         )
-        add(template_trans1.template)
-        flow1.template_dependencies.add(template_trans1.template)
+        flow1.template_dependencies.add(template)
 
         return (flow1, flow2)
 
@@ -1385,10 +1311,10 @@ class OrgDeleteTest(TembaTest):
         add(FlowStartCount.objects.create(start=start1, count=1))
 
     def _create_ticket_content(self, org, user, contacts, flows, add):
-        ticket1 = add(self.create_ticket(contacts[0], "Help"))
+        ticket1 = add(self.create_ticket(contacts[0]))
         ticket1.events.create(org=org, contact=contacts[0], event_type="N", note="spam", created_by=user)
 
-        add(self.create_ticket(contacts[0], "Help", opened_in=flows[0]))
+        add(self.create_ticket(contacts[0], opened_in=flows[0]))
 
     def _create_export_content(self, org, user, flows, groups, fields, labels, add):
         results = add(
@@ -1420,28 +1346,15 @@ class OrgDeleteTest(TembaTest):
         ExportFinishedNotificationType.create(tickets)
 
     def _create_archive_content(self, org, add):
-        def create_archive(org, period, rollup=None):
-            file = f"{org.id}/archive{Archive.objects.all().count()}.jsonl.gz"
-            body, md5, size = jsonlgz_encode([{"id": 1}])
-            archive = Archive.objects.create(
-                org=org,
-                url=f"http://temba-archives.aws.com/{file}",
-                start_date=timezone.now(),
-                build_time=100,
-                archive_type=Archive.TYPE_MSG,
-                period=period,
-                rollup=rollup,
-                size=size,
-                hash=md5,
+        daily = add(self.create_archive(Archive.TYPE_MSG, Archive.PERIOD_DAILY, timezone.now(), [{"id": 1}], org=org))
+        add(
+            self.create_archive(
+                Archive.TYPE_MSG, Archive.PERIOD_MONTHLY, timezone.now(), [{"id": 1}], rollup_of=(daily,), org=org
             )
-            self.mock_s3.put_object("temba-archives", file, body)
-            return archive
-
-        daily = add(create_archive(org, Archive.PERIOD_DAILY))
-        add(create_archive(org, Archive.PERIOD_MONTHLY, daily))
+        )
 
         # extra S3 file in archive dir
-        self.mock_s3.put_object("temba-archives", f"{org.id}/extra_file.json", io.StringIO("[]"))
+        Archive.storage().save(f"{org.id}/extra_file.json", io.StringIO("[]"))
 
     def _exists(self, obj) -> bool:
         return obj._meta.model.objects.filter(id=obj.id).exists()
@@ -1530,10 +1443,9 @@ class OrgDeleteTest(TembaTest):
         self.assertOrgActive(self.org2, org2_content)
 
         # make it look like released orgs were released over a week ago
-        Org.objects.exclude(released_on=None).update(released_on=timezone.now() - timedelta(days=8))
+        Org.objects.exclude(released_on=None).update(released_on=F("released_on") - timedelta(days=8))
 
-        with patch("temba.utils.s3.client", return_value=self.mock_s3):
-            delete_released_orgs()
+        delete_released_orgs()
 
         self.assertOrgDeleted(self.org, org1_content)
         self.assertOrgDeleted(org1_child1)
@@ -1541,14 +1453,14 @@ class OrgDeleteTest(TembaTest):
         self.assertOrgActive(self.org2, org2_content)
 
         # only org 2 files left in S3
-        self.assertEqual(
-            [
-                ("temba-archives", f"{self.org2.id}/archive2.jsonl.gz"),
-                ("temba-archives", f"{self.org2.id}/archive3.jsonl.gz"),
-                ("temba-archives", f"{self.org2.id}/extra_file.json"),
-            ],
-            list(self.mock_s3.objects.keys()),
-        )
+        for archive in self.org2.archives.all():
+            self.assertTrue(Archive.storage().exists(archive.get_storage_location()[1]))
+
+        self.assertTrue(Archive.storage().exists(f"{self.org2.id}/extra_file.json"))
+        self.assertFalse(Archive.storage().exists(f"{self.org.id}/extra_file.json"))
+
+        # check we've initiated search de-indexing for all deleted orgs
+        self.assertEqual({org1_child1, org1_child2, self.org}, {c.args[0] for c in mr_mocks.calls["org_deindex"]})
 
         # we don't actually delete org objects but at this point there should be no related fields preventing that
         Model.delete(org1_child1)
@@ -1623,184 +1535,6 @@ class AnonOrgTest(TembaTest):
 
 
 class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
-    def test_manage_accounts(self):
-        accounts_url = reverse("orgs.org_manage_accounts")
-        settings_url = reverse("orgs.org_workspace")
-
-        # nobody can access if we don't have users feature
-        self.login(self.admin)
-        self.assertRedirect(self.client.get(accounts_url), settings_url)
-
-        self.org.features = [Org.FEATURE_USERS, Org.FEATURE_VIEWERS]
-        self.org.save(update_fields=("features",))
-
-        # create invitations
-        invitation1 = Invitation.objects.create(
-            org=self.org, email="norkans7@gmail.com", user_group="A", created_by=self.admin, modified_by=self.admin
-        )
-        invitation2 = Invitation.objects.create(
-            org=self.org, email="bob@tickets.com", user_group="T", created_by=self.admin, modified_by=self.admin
-        )
-
-        # only admins can access
-        self.assertRequestDisallowed(accounts_url, [None, self.user, self.editor])
-
-        # order should be users by email, then invitations by email
-        expected_fields = []
-        for user in self.org.users.order_by("email"):
-            expected_fields.extend([f"user_{user.id}_role", f"user_{user.id}_remove"])
-        for inv in self.org.invitations.order_by("email"):
-            expected_fields.extend([f"invite_{inv.id}_role", f"invite_{inv.id}_remove"])
-
-        response = self.assertUpdateFetch(accounts_url, [self.admin], form_fields=expected_fields)
-
-        self.assertEqual("A", response.context["form"].fields[f"user_{self.admin.id}_role"].initial)
-        self.assertEqual("E", response.context["form"].fields[f"user_{self.editor.id}_role"].initial)
-
-        self.assertContains(response, "norkans7@gmail.com")
-
-        # give users an API token and give admin and editor an additional surveyor-role token
-        APIToken.get_or_create(self.org, self.admin)
-        APIToken.get_or_create(self.org, self.editor)
-        APIToken.get_or_create(self.org, self.surveyor)
-        APIToken.get_or_create(self.org, self.admin, role=OrgRole.SURVEYOR)
-        APIToken.get_or_create(self.org, self.editor, role=OrgRole.SURVEYOR)
-
-        # leave admin, editor and agent as is, but change user to an editor too, and remove the surveyor user
-        response = self.assertUpdateSubmit(
-            accounts_url,
-            self.admin,
-            {
-                f"user_{self.admin.id}_role": "A",
-                f"user_{self.editor.id}_role": "E",
-                f"user_{self.user.id}_role": "E",
-                f"user_{self.surveyor.id}_role": "S",
-                f"user_{self.surveyor.id}_remove": "1",
-                f"user_{self.agent.id}_role": "T",
-            },
-        )
-        self.assertRedirect(response, reverse("orgs.org_manage_accounts"))
-
-        self.assertEqual({self.admin, self.agent, self.editor, self.user}, set(self.org.users.all()))
-        self.assertEqual({self.admin}, set(self.org.get_users(roles=[OrgRole.ADMINISTRATOR])))
-        self.assertEqual({self.user, self.editor}, set(self.org.get_users(roles=[OrgRole.EDITOR])))
-        self.assertEqual(set(), set(self.org.get_users(roles=[OrgRole.VIEWER])))
-        self.assertEqual(set(), set(self.org.get_users(roles=[OrgRole.SURVEYOR])))
-        self.assertEqual({self.agent}, set(self.org.get_users(roles=[OrgRole.AGENT])))
-
-        # our surveyor's API token will have been deleted
-        self.assertEqual(self.admin.api_tokens.filter(is_active=True).count(), 2)
-        self.assertEqual(self.editor.api_tokens.filter(is_active=True).count(), 2)
-        self.assertEqual(self.surveyor.api_tokens.filter(is_active=True).count(), 0)
-
-        # pretend our first invite was acted on
-        invitation1.release()
-
-        # no longer appears in list
-        response = self.client.get(accounts_url)
-        self.assertNotContains(response, "norkans7@gmail.com")
-
-        # try to remove ourselves as admin
-        response = self.assertUpdateSubmit(
-            accounts_url,
-            self.admin,
-            {
-                f"user_{self.admin.id}_role": "A",
-                f"user_{self.admin.id}_remove": "1",
-                f"user_{self.editor.id}_role": "E",
-                f"user_{self.user.id}_role": "V",
-                f"user_{self.agent.id}_role": "T",
-            },
-            form_errors={"__all__": "A workspace must have at least one administrator."},
-            object_unchanged=self.org,
-        )
-
-        # try to downgrade ourselves to an editor
-        response = self.assertUpdateSubmit(
-            accounts_url,
-            self.admin,
-            {
-                f"user_{self.admin.id}_role": "E",
-                f"user_{self.editor.id}_role": "E",
-                f"user_{self.user.id}_role": "V",
-                f"user_{self.agent.id}_role": "T",
-            },
-            form_errors={"__all__": "A workspace must have at least one administrator."},
-            object_unchanged=self.org,
-        )
-
-        # finally upgrade agent to admin, downgrade editor to agent, remove ourselves entirely and remove last invite
-        response = self.assertUpdateSubmit(
-            accounts_url,
-            self.admin,
-            {
-                f"user_{self.admin.id}_role": "A",
-                f"user_{self.admin.id}_remove": "1",
-                f"user_{self.editor.id}_role": "T",
-                f"user_{self.user.id}_role": "E",
-                f"user_{self.agent.id}_role": "A",
-                f"invite_{invitation2.id}_remove": "1",
-            },
-        )
-
-        # we should be redirected to chooser page
-        self.assertRedirect(response, reverse("orgs.org_choose"))
-
-        self.assertEqual(0, self.org.invitations.filter(is_active=True).count())
-
-        # and removed from this org
-        self.org.refresh_from_db()
-        self.assertEqual(set(self.org.users.all()), {self.agent, self.editor, self.user})
-        self.assertEqual({self.agent}, set(self.org.get_users(roles=[OrgRole.ADMINISTRATOR])))
-        self.assertEqual({self.user}, set(self.org.get_users(roles=[OrgRole.EDITOR])))
-        self.assertEqual(set(), set(self.org.get_users(roles=[OrgRole.VIEWER])))
-        self.assertEqual(set(), set(self.org.get_users(roles=[OrgRole.SURVEYOR])))
-        self.assertEqual({self.editor}, set(self.org.get_users(roles=[OrgRole.AGENT])))
-
-        # editor will have lost their API tokens
-        self.editor.refresh_from_db()
-        self.assertEqual(0, self.editor.api_tokens.filter(is_active=True).count())
-
-        # and all our API tokens for the admin are deleted
-        self.admin.refresh_from_db()
-        self.assertEqual(self.admin.api_tokens.filter(is_active=True).count(), 0)
-
-    def test_manage_children(self):
-        children_url = reverse("orgs.org_sub_orgs")
-
-        # give our org the multi users feature
-        self.org.features = [Org.FEATURE_USERS, Org.FEATURE_CHILD_ORGS]
-        self.org.save()
-
-        # add a sub org
-        child = Org.objects.create(
-            name="Child Workspace",
-            timezone=ZoneInfo("US/Pacific"),
-            flow_languages=["eng"],
-            created_by=self.admin,
-            modified_by=self.admin,
-            parent=self.org,
-        )
-        child.initialize()
-        child.add_user(self.admin, OrgRole.ADMINISTRATOR)
-
-        child_accounts_url = reverse("orgs.org_manage_accounts_sub_org") + f"?org={child.id}"
-
-        self.assertRequestDisallowed(children_url, [None, self.user, self.editor, self.agent])
-        response = self.assertListFetch(children_url, [self.admin], choose_org=self.org)
-        self.assertContains(response, "Child Workspace")
-        self.assertContains(response, child_accounts_url)
-
-        # only admin for parent can see account page for child
-        self.assertRequestDisallowed(child_accounts_url, [None, self.user, self.editor, self.agent, self.admin2])
-
-        self.assertUpdateFetch(
-            child_accounts_url,
-            [self.admin],
-            form_fields=[f"user_{self.admin.id}_role", f"user_{self.admin.id}_remove"],
-            choose_org=self.org,
-        )
-
     def test_menu(self):
         menu_url = reverse("orgs.org_menu")
 
@@ -1839,7 +1573,10 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
                 "Account",
                 "Resthooks",
                 "Incidents",
-                ("Channels", ["Test Channel"]),
+                "Export",
+                "Import",
+                ("Channels", ["New Channel", "Test Channel"]),
+                ("Classifiers", ["New Classifier"]),
                 ("Archives", ["Messages", "Flow Runs"]),
             ],
             choose_org=self.org,
@@ -1893,34 +1630,6 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         menu = self.client.get(menu_url).json()["results"]
         self.assertEqual("tomato", menu[8]["bubble"])
 
-    def test_read(self):
-        read_url = reverse("orgs.org_read", args=[self.org.id])
-
-        # make our second org a child
-        self.org2.parent = self.org
-        self.org2.save()
-
-        response = self.assertStaffOnly(read_url)
-
-        # we should have a child in our context
-        self.assertEqual(1, len(response.context["children"]))
-
-        # we should have options to flag and suspend
-        self.assertContentMenu(read_url, self.customer_support, ["Edit", "Flag", "Suspend", "Verify", "-", "Service"])
-
-        # flag and content menu option should be inverted
-        self.org.flag()
-        self.org.suspend()
-
-        self.assertContentMenu(
-            read_url, self.customer_support, ["Edit", "Unflag", "Unsuspend", "Verify", "-", "Service"]
-        )
-
-        # no menu for inactive orgs
-        self.org.is_active = False
-        self.org.save()
-        self.assertContentMenu(read_url, self.customer_support, [])
-
     def test_workspace(self):
         workspace_url = reverse("orgs.org_workspace")
 
@@ -1938,7 +1647,10 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
                 "Account",
                 "Resthooks",
                 "Incidents",
-                ("Channels", ["Test Channel"]),
+                "Export",
+                "Import",
+                ("Channels", ["New Channel", "Test Channel"]),
+                ("Classifiers", ["New Classifier"]),
                 ("Archives", ["Messages", "Flow Runs"]),
             ],
         )
@@ -1956,7 +1668,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
             parent=self.org,
         )
 
-        with self.assertNumQueries(11):
+        with self.assertNumQueries(9):
             response = self.client.get(workspace_url)
 
         # should have an extra menu options for workspaces and users
@@ -1965,12 +1677,17 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
             self.admin,
             [
                 "Nyaruka",
-                "Workspaces (1)",
                 "Account",
-                "Users (5)",
                 "Resthooks",
                 "Incidents",
-                ("Channels", ["Test Channel"]),
+                "Workspaces (2)",
+                "Dashboard",
+                "Users (4)",
+                "Invitations (0)",
+                "Export",
+                "Import",
+                ("Channels", ["New Channel", "Test Channel"]),
+                ("Classifiers", ["New Classifier"]),
                 ("Archives", ["Messages", "Flow Runs"]),
             ],
         )
@@ -2094,13 +1811,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.client.get(reverse("orgs.org_join", args=["invalid"]))
         self.assertRedirect(response, reverse("public.public_index"))
 
-        invitation = Invitation.objects.create(
-            org=self.org,
-            user_group="E",
-            email="edwin@nyaruka.com",
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
+        invitation = Invitation.create(self.org, self.admin, "edwin@nyaruka.com", OrgRole.EDITOR)
 
         join_url = reverse("orgs.org_join", args=[invitation.secret])
         join_signup_url = reverse("orgs.org_join_signup", args=[invitation.secret])
@@ -2126,18 +1837,30 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         # should be logged out as the other user
         self.assertEqual(0, len(self.client.session.keys()))
 
+        # invitation with mismatching case email
+        invitation2 = Invitation.create(self.org2, self.admin, "eDwin@nyaruka.com", OrgRole.EDITOR)
+
+        join_accept_url = reverse("orgs.org_join_accept", args=[invitation2.secret])
+        join_url = reverse("orgs.org_join", args=[invitation2.secret])
+
+        self.login(user)
+
+        response = self.client.get(join_url)
+        self.assertRedirect(response, join_accept_url)
+
+        # but only if they're the currently logged in user
+        self.login(self.admin)
+
+        response = self.client.get(join_url)
+        self.assertContains(response, "Sign in to join the <b>Trileet Inc.</b> workspace")
+        self.assertContains(response, f"/users/login/?next={join_accept_url}")
+
     def test_join_signup(self):
         # if invitation secret is invalid, redirect to root
         response = self.client.get(reverse("orgs.org_join_signup", args=["invalid"]))
         self.assertRedirect(response, reverse("public.public_index"))
 
-        invitation = Invitation.objects.create(
-            org=self.org,
-            user_group="A",
-            email="administrator@trileet.com",
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
+        invitation = Invitation.create(self.org, self.admin, "administrator@trileet.com", OrgRole.ADMINISTRATOR)
 
         join_signup_url = reverse("orgs.org_join_signup", args=[invitation.secret])
         join_url = reverse("orgs.org_join", args=[invitation.secret])
@@ -2146,13 +1869,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.client.get(join_signup_url)
         self.assertRedirect(response, join_url)
 
-        invitation = Invitation.objects.create(
-            org=self.org,
-            user_group="E",
-            email="edwin@nyaruka.com",
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
+        invitation = Invitation.create(self.org, self.admin, "edwin@nyaruka.com", OrgRole.EDITOR)
 
         join_signup_url = reverse("orgs.org_join_signup", args=[invitation.secret])
         join_url = reverse("orgs.org_join", args=[invitation.secret])
@@ -2172,6 +1889,9 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         invitation.refresh_from_db()
         self.assertFalse(invitation.is_active)
 
+        self.assertEqual(1, self.admin.notifications.filter(notification_type="invitation:accepted").count())
+        self.assertEqual(2, self.org.get_users(roles=[OrgRole.EDITOR]).count())
+
     def test_join_accept(self):
         # only authenticated users can access page
         response = self.client.get(reverse("orgs.org_join_accept", args=["invalid"]))
@@ -2182,13 +1902,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.client.get(reverse("orgs.org_join_accept", args=["invalid"]))
         self.assertRedirect(response, reverse("public.public_index"))
 
-        invitation = Invitation.objects.create(
-            org=self.org,
-            user_group="E",
-            email="edwin@nyaruka.com",
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
+        invitation = Invitation.create(self.org, self.admin, "edwin@nyaruka.com", OrgRole.EDITOR)
 
         join_accept_url = reverse("orgs.org_join_accept", args=[invitation.secret])
         join_url = reverse("orgs.org_join", args=[invitation.secret])
@@ -2213,6 +1927,9 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
 
         invitation.refresh_from_db()
         self.assertFalse(invitation.is_active)
+
+        self.assertEqual(1, self.admin.notifications.filter(notification_type="invitation:accepted").count())
+        self.assertEqual(2, self.org.get_users(roles=[OrgRole.EDITOR]).count())
 
     def test_org_grant(self):
         grant_url = reverse("orgs.org_grant")
@@ -2425,9 +2142,8 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         org = Org.objects.get(name="AlexCom")
         self.assertEqual(org.timezone, ZoneInfo("Africa/Kigali"))
 
-        # of which our user is an administrator and can generate an API token
+        # of which our user is an administrator
         self.assertIn(user, org.get_admins())
-        self.assertIsNotNone(user.get_api_token(org))
 
         # not the logged in user at the signup time
         self.assertNotIn(self.user, org.get_admins())
@@ -2441,6 +2157,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
     )
     def test_signup(self):
         signup_url = reverse("orgs.org_signup")
+        edit_url = reverse("orgs.user_edit")
 
         response = self.client.get(signup_url + "?%s" % urlencode({"email": "address@example.com"}))
         self.assertEqual(response.status_code, 200)
@@ -2531,9 +2248,8 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(org.timezone, ZoneInfo("Africa/Kigali"))
         self.assertEqual(str(org), "Relieves World")
 
-        # of which our user is an administrator, and can generate an API token
+        # of which our user is an administrator
         self.assertIn(user, org.get_admins())
-        self.assertIsNotNone(user.get_api_token(org))
 
         # check default org content was created correctly
         system_fields = set(org.fields.filter(is_system=True).values_list("key", flat=True))
@@ -2541,7 +2257,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         sample_flows = set(org.flows.values_list("name", flat=True))
 
         self.assertEqual({"created_on", "last_seen_on"}, system_fields)
-        self.assertEqual({"Active", "Archived", "Blocked", "Stopped", "Open Tickets"}, system_groups)
+        self.assertEqual({"\\Active", "\\Archived", "\\Blocked", "\\Stopped", "Open Tickets"}, system_groups)
         self.assertEqual(
             {"Sample Flow - Order Status Checker", "Sample Flow - Satisfaction Survey", "Sample Flow - Simple Poll"},
             sample_flows,
@@ -2586,22 +2302,29 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(200, response.status_code)
 
         # try changing our username, wrong password
-        post_data = dict(email="myal@wr.org", current_password="HelloWorld")
-        response = self.client.post(reverse("orgs.user_edit"), post_data)
+        response = self.client.post(edit_url, {"email": "myal@wr.org", "current_password": "HelloWorld"})
         self.assertEqual(200, response.status_code)
-        self.assertIn("current_password", response.context["form"].errors)
+        self.assertFormError(
+            response.context["form"],
+            "current_password",
+            "Please enter your password to save changes.",
+        )
 
         # bad new password
-        post_data = dict(email="myal@wr.org", current_password="HelloWorld1", new_password="passwor")
-        response = self.client.post(reverse("orgs.user_edit"), post_data)
+        response = self.client.post(
+            edit_url, {"email": "myal@wr.org", "current_password": "HelloWorld1", "new_password": "passwor"}
+        )
         self.assertEqual(200, response.status_code)
-        self.assertIn("new_password", response.context["form"].errors)
+        self.assertFormError(
+            response.context["form"],
+            "new_password",
+            "This password is too short. It must contain at least 8 characters.",
+        )
 
         User.objects.create(username="bill@msn.com", email="bill@msn.com")
 
         # dupe user
-        post_data = dict(email="bill@msn.com", current_password="HelloWorld1")
-        response = self.client.post(reverse("orgs.user_edit"), post_data)
+        response = self.client.post(edit_url, {"email": "bill@MSN.com", "current_password": "HelloWorld1"})
         self.assertEqual(200, response.status_code)
         self.assertFormError(response.context["form"], "email", "Sorry, that email address is already taken.")
 
@@ -2612,7 +2335,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
             language="en-us",
             current_password="HelloWorld1",
         )
-        response = self.client.post(reverse("orgs.user_edit"), post_data, HTTP_X_FORMAX=True)
+        response = self.client.post(edit_url, post_data, HTTP_X_FORMAX=True)
         self.assertEqual(200, response.status_code)
 
         self.assertTrue(User.objects.get(username="myal@wr.org"))
@@ -2621,28 +2344,14 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertFalse(User.objects.filter(email="myal@relieves.org"))
 
     def test_create_new(self):
-        children_url = reverse("orgs.org_sub_orgs")
         create_url = reverse("orgs.org_create")
 
-        self.login(self.admin)
-
-        # by default orgs don't have this feature
-        response = self.client.get(children_url)
-        self.assertContentMenu(children_url, self.admin, [])
-
-        # trying to access the modal directly should redirect
-        response = self.client.get(create_url)
-        self.assertRedirect(response, "/org/workspace/")
+        # nobody can access if new orgs feature not enabled
+        response = self.requestView(create_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
 
         self.org.features = [Org.FEATURE_NEW_ORGS]
         self.org.save(update_fields=("features",))
-
-        response = self.client.get(children_url)
-        self.assertContentMenu(children_url, self.admin, ["New Workspace"])
-
-        # give org2 the same feature
-        self.org2.features = [Org.FEATURE_NEW_ORGS]
-        self.org2.save(update_fields=("features",))
 
         # since we can only create new orgs, we don't show type as an option
         self.assertRequestDisallowed(create_url, [None, self.user, self.editor, self.agent])
@@ -2675,24 +2384,18 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(str(new_org.id), response.headers["X-Temba-Org"])
 
     def test_create_child(self):
-        children_url = reverse("orgs.org_sub_orgs")
+        list_url = reverse("orgs.org_list")
         create_url = reverse("orgs.org_create")
 
-        self.login(self.admin)
-
-        # by default orgs don't have the new_orgs or child_orgs feature
-        response = self.client.get(children_url)
-        self.assertContentMenu(children_url, self.admin, [])
-
-        # trying to access the modal directly should redirect
-        response = self.client.get(create_url)
-        self.assertRedirect(response, "/org/workspace/")
+        # nobody can access if child orgs feature not enabled
+        response = self.requestView(create_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
 
         self.org.features = [Org.FEATURE_CHILD_ORGS]
         self.org.save(update_fields=("features",))
 
-        response = self.client.get(children_url)
-        self.assertContentMenu(children_url, self.admin, ["New Workspace"])
+        response = self.client.get(list_url)
+        self.assertContentMenu(list_url, self.admin, ["New"])
 
         # give org2 the same feature
         self.org2.features = [Org.FEATURE_CHILD_ORGS]
@@ -2724,7 +2427,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(OrgRole.ADMINISTRATOR, child_org.get_user_role(self.admin))
 
         # should have been redirected to child management page
-        self.assertRedirect(response, "/org/sub_orgs/")
+        self.assertRedirect(response, "/org/")
 
     def test_create_child_or_new(self):
         create_url = reverse("orgs.org_create")
@@ -2768,83 +2471,79 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
 
         response = self.client.post(create_url, {"name": "Child Org", "timezone": "Africa/Nairobi"}, HTTP_TEMBA_SPA=1)
 
-        self.assertRedirect(response, reverse("orgs.org_sub_orgs"))
+        self.assertRedirect(response, reverse("orgs.org_list"))
 
-    def test_child_management(self):
-        sub_orgs_url = reverse("orgs.org_sub_orgs")
-        menu_url = reverse("orgs.org_menu") + "settings/"
+    def test_list(self):
+        list_url = reverse("orgs.org_list")
 
-        self.login(self.admin)
-
-        response = self.client.get(menu_url)
-        self.assertNotContains(response, "Workspaces")
-        self.assertNotContains(response, sub_orgs_url)
+        # nobody can access if child orgs feature not enabled
+        response = self.requestView(list_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
 
         # enable child orgs and create some child orgs
-        self.org.features = [Org.FEATURE_CHILD_ORGS, Org.FEATURE_USERS]
+        self.org.features = [Org.FEATURE_CHILD_ORGS]
         self.org.save(update_fields=("features",))
         child1 = self.org.create_new(self.admin, "Child Org 1", self.org.timezone, as_child=True)
         child2 = self.org.create_new(self.admin, "Child Org 2", self.org.timezone, as_child=True)
 
-        # now we see the Workspaces menu item
-        self.login(self.admin, choose_org=self.org)
-
-        response = self.client.get(menu_url)
-        self.assertContains(response, "Workspaces")
-        self.assertContains(response, sub_orgs_url)
-
         response = self.assertListFetch(
-            sub_orgs_url, [self.admin], context_objects=[child1, child2], choose_org=self.org
+            list_url, [self.admin], context_objects=[self.org, child1, child2], choose_org=self.org
+        )
+        self.assertContains(response, "Child Org 1")
+        self.assertContains(response, "Child Org 2")
+
+        # can search by name
+        self.assertListFetch(
+            list_url + "?search=child", [self.admin], context_objects=[child1, child2], choose_org=self.org
         )
 
-        child1_edit_url = reverse("orgs.org_edit_sub_org") + f"?org={child1.id}"
-        child1_accounts_url = reverse("orgs.org_manage_accounts_sub_org") + f"?org={child1.id}"
+    def test_update(self):
+        # enable child orgs and create some child orgs
+        self.org.features = [Org.FEATURE_CHILD_ORGS]
+        self.org.save(update_fields=("features",))
+        child1 = self.org.create_new(self.admin, "Child Org 1", self.org.timezone, as_child=True)
 
-        self.assertContains(response, "Child Org 1")
-        self.assertContains(response, child1_accounts_url)
+        update_url = reverse("orgs.org_update", args=[child1.id])
 
-        # we can also access the manage accounts page
-        response = self.client.get(child1_accounts_url)
-        self.assertEqual(200, response.status_code)
+        self.assertRequestDisallowed(update_url, [None, self.user, self.editor, self.agent, self.admin2])
+        self.assertUpdateFetch(
+            update_url, [self.admin], form_fields=["name", "timezone", "date_format", "language"], choose_org=self.org
+        )
 
-        response = self.client.get(child1_accounts_url, HTTP_TEMBA_SPA=1)
-        self.assertContains(response, child1.name)
-
-        # edit our sub org's details
-        response = self.client.post(
-            child1_edit_url,
+        response = self.assertUpdateSubmit(
+            update_url,
+            self.admin,
             {"name": "New Child Name", "timezone": "Africa/Nairobi", "date_format": "Y", "language": "es"},
         )
-        self.assertEqual(sub_orgs_url, response.url)
 
         child1.refresh_from_db()
         self.assertEqual("New Child Name", child1.name)
-        self.assertEqual("/org/sub_orgs/", response.url)
-
-        # edit our sub org's details in a spa view
-        response = self.client.post(
-            child1_edit_url,
-            {"name": "Spa Child Name", "timezone": "Africa/Nairobi", "date_format": "Y", "language": "es"},
-            HTTP_TEMBA_SPA=1,
-        )
-
-        self.assertEqual(reverse("orgs.org_sub_orgs"), response.url)
-
-        child1.refresh_from_db()
-        self.assertEqual("Spa Child Name", child1.name)
-        self.assertEqual("Africa/Nairobi", str(child1.timezone))
-        self.assertEqual("Y", child1.date_format)
-        self.assertEqual("es", child1.language)
+        self.assertEqual("/org/", response.url)
 
         # if org doesn't exist, 404
-        response = self.client.get(f"{reverse('orgs.org_edit_sub_org')}?org=3464374")
+        response = self.requestView(reverse("orgs.org_update", args=[3464374]), self.admin, choose_org=self.org)
         self.assertEqual(404, response.status_code)
 
-        self.login(self.admin2)
+    def test_delete(self):
+        self.org.features = [Org.FEATURE_CHILD_ORGS]
+        self.org.save(update_fields=("features",))
 
-        # same if it's not a child of the request org
-        response = self.client.get(f"{reverse('orgs.org_edit_sub_org')}?org={child1.id}")
-        self.assertEqual(404, response.status_code)
+        child = self.org.create_new(self.admin, "Child Workspace", self.org.timezone, as_child=True)
+        delete_url = reverse("orgs.org_delete", args=[child.id])
+
+        self.assertRequestDisallowed(delete_url, [None, self.user, self.editor, self.agent, self.admin2])
+        self.assertDeleteFetch(delete_url, [self.admin], choose_org=self.org)
+
+        # schedule for deletion
+        response = self.client.get(delete_url)
+        self.assertContains(response, "You are about to delete the workspace <b>Child Workspace</b>")
+
+        # go through with it, redirects to workspaces list page
+        response = self.client.post(delete_url)
+        self.assertEqual(reverse("orgs.org_list"), response["Temba-Success"])
+
+        child.refresh_from_db()
+        self.assertFalse(child.is_active)
 
     def test_start(self):
         # the start view routes users based on their role
@@ -2860,7 +2559,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertRedirect(self.requestView(start_url, self.agent), "/ticket/")
 
         # now try as customer support
-        self.assertRedirect(self.requestView(start_url, self.customer_support), "/org/manage/")
+        self.assertRedirect(self.requestView(start_url, self.customer_support), "/staff/org/")
 
         # if org isn't set, we redirect instead to choose view
         self.client.logout()
@@ -2895,7 +2594,7 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertContains(response, "No workspaces for this account, please contact your administrator.")
 
         # unless they are staff
-        self.assertRedirect(self.requestView(choose_url, self.customer_support), "/org/manage/")
+        self.assertRedirect(self.requestView(choose_url, self.customer_support), "/staff/org/")
 
         # turn editor into a multi-org user
         self.org2.add_user(self.editor, OrgRole.EDITOR)
@@ -2965,128 +2664,6 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual("Y", self.org.date_format)
         self.assertEqual("es", self.org.language)
 
-    def test_delete_child(self):
-        self.org.features = [Org.FEATURE_CHILD_ORGS]
-        self.org.save(update_fields=("features",))
-
-        child = self.org.create_new(self.admin, "Child Workspace", self.org.timezone, as_child=True)
-        delete_url = reverse("orgs.org_delete_child", args=[child.id])
-
-        self.assertRequestDisallowed(delete_url, [None, self.user, self.editor, self.agent, self.admin2])
-        self.assertDeleteFetch(delete_url, [self.admin], choose_org=self.org)
-
-        # schedule for deletion
-        response = self.client.get(delete_url)
-        self.assertContains(response, "You are about to delete the workspace <b>Child Workspace</b>")
-
-        # go through with it, redirects to main workspace page
-        response = self.client.post(delete_url)
-        self.assertEqual(reverse("orgs.org_sub_orgs"), response["Temba-Success"])
-
-        child.refresh_from_db()
-        self.assertFalse(child.is_active)
-
-    def test_administration(self):
-        self.setUpLocations()
-
-        manage_url = reverse("orgs.org_manage")
-        update_url = reverse("orgs.org_update", args=[self.org.id])
-
-        self.assertStaffOnly(manage_url)
-        self.assertStaffOnly(update_url)
-
-        def assertOrgFilter(query: str, expected_orgs: list):
-            response = self.client.get(manage_url + query)
-            self.assertIsNotNone(response.headers.get(TEMBA_MENU_SELECTION, None))
-            self.assertEqual(expected_orgs, list(response.context["object_list"]))
-
-        assertOrgFilter("", [self.org2, self.org])
-        assertOrgFilter("?filter=all", [self.org2, self.org])
-        assertOrgFilter("?filter=xxxx", [self.org2, self.org])
-        assertOrgFilter("?filter=flagged", [])
-        assertOrgFilter("?filter=anon", [])
-        assertOrgFilter("?filter=suspended", [])
-        assertOrgFilter("?filter=verified", [])
-
-        self.org.flag()
-
-        assertOrgFilter("?filter=flagged", [self.org])
-
-        self.org2.verify()
-
-        assertOrgFilter("?filter=verified", [self.org2])
-
-        # and can go to our org
-        response = self.client.get(update_url)
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(
-            [
-                "name",
-                "features",
-                "is_anon",
-                "channels_limit",
-                "fields_limit",
-                "globals_limit",
-                "groups_limit",
-                "labels_limit",
-                "teams_limit",
-                "topics_limit",
-                "loc",
-            ],
-            list(response.context["form"].fields.keys()),
-        )
-
-        # make some changes to our org
-        response = self.client.post(
-            update_url,
-            {
-                "name": "Temba II",
-                "features": ["new_orgs"],
-                "is_anon": False,
-                "channels_limit": 20,
-                "fields_limit": 300,
-                "globals_limit": "",
-                "groups_limit": 400,
-                "labels_limit": "",
-                "teams_limit": "",
-                "topics_limit": "",
-            },
-        )
-        self.assertEqual(302, response.status_code)
-
-        self.org.refresh_from_db()
-        self.assertEqual("Temba II", self.org.name)
-        self.assertEqual(["new_orgs"], self.org.features)
-        self.assertEqual(self.org.get_limit(Org.LIMIT_FIELDS), 300)
-        self.assertEqual(self.org.get_limit(Org.LIMIT_GLOBALS), 250)  # uses default
-        self.assertEqual(self.org.get_limit(Org.LIMIT_GROUPS), 400)
-        self.assertEqual(self.org.get_limit(Org.LIMIT_CHANNELS), 20)
-
-        # flag org
-        self.client.post(update_url, {"action": "flag"})
-        self.org.refresh_from_db()
-        self.assertTrue(self.org.is_flagged)
-
-        # unflag org
-        self.client.post(update_url, {"action": "unflag"})
-        self.org.refresh_from_db()
-        self.assertFalse(self.org.is_flagged)
-
-        # suspend org
-        self.client.post(update_url, {"action": "suspend"})
-        self.org.refresh_from_db()
-        self.assertTrue(self.org.is_suspended)
-
-        # unsuspend org
-        self.client.post(update_url, {"action": "unsuspend"})
-        self.org.refresh_from_db()
-        self.assertFalse(self.org.is_suspended)
-
-        # verify
-        self.client.post(update_url, {"action": "verify"})
-        self.org.refresh_from_db()
-        self.assertTrue(self.org.is_verified)
-
     def test_urn_schemes(self):
         # remove existing channels
         Channel.objects.all().update(is_active=False, org=None)
@@ -3132,75 +2709,6 @@ class OrgCRUDLTest(TembaTest, CRUDLTestMixin):
         response = self.client.post(login_url, {"username": "admin@nyaruka.com", "password": "QWERTY123"}, follow=True)
         self.assertIn("form", response.context)
         self.assertTrue(response.context["form"].errors)
-
-    @mock_mailroom
-    def test_service(self, mr_mocks):
-        service_url = reverse("orgs.org_service")
-        inbox_url = reverse("msgs.msg_inbox")
-
-        # without logging in, try to service our main org
-        response = self.client.get(service_url, {"other_org": self.org.id, "next": inbox_url})
-        self.assertLoginRedirect(response)
-
-        response = self.client.post(service_url, {"other_org": self.org.id})
-        self.assertLoginRedirect(response)
-
-        # try logging in with a normal user
-        self.login(self.admin)
-
-        # same thing, no permission
-        response = self.client.get(service_url, {"other_org": self.org.id, "next": inbox_url})
-        self.assertLoginRedirect(response)
-
-        response = self.client.post(service_url, {"other_org": self.org.id})
-        self.assertLoginRedirect(response)
-
-        # ok, log in as our cs rep
-        self.login(self.customer_support)
-
-        # getting invalid org, has no service form
-        response = self.client.get(service_url, {"other_org": 325253256, "next": inbox_url})
-        self.assertContains(response, "Invalid org")
-
-        # posting invalid org just redirects back to manage page
-        response = self.client.post(service_url, {"other_org": 325253256})
-        self.assertRedirect(response, "/org/manage/")
-
-        # then service our org
-        response = self.client.get(service_url, {"other_org": self.org.id})
-        self.assertContains(response, "You are about to service the workspace, <b>Nyaruka</b>.")
-
-        # requesting a next page has a slightly different message
-        response = self.client.get(service_url, {"other_org": self.org.id, "next": inbox_url})
-        self.assertContains(response, "The page you are requesting belongs to a different workspace, <b>Nyaruka</b>.")
-
-        response = self.client.post(service_url, {"other_org": self.org.id})
-        self.assertRedirect(response, "/msg/")
-        self.assertEqual(self.org.id, self.client.session["org_id"])
-        self.assertTrue(self.client.session["servicing"])
-
-        # specify redirect_url
-        response = self.client.post(service_url, {"other_org": self.org.id, "next": "/flow/"})
-        self.assertRedirect(response, "/flow/")
-
-        # create a new contact
-        response = self.client.post(
-            reverse("contacts.contact_create"), data=dict(name="Ben Haggerty", phone="0788123123")
-        )
-        self.assertNoFormErrors(response)
-
-        # make sure that contact's created on is our cs rep
-        contact = Contact.objects.get(urns__path="+250788123123", org=self.org)
-        self.assertEqual(self.customer_support, contact.created_by)
-
-        self.assertEqual(self.org.id, self.client.session["org_id"])
-        self.assertTrue(self.client.session["servicing"])
-
-        # stop servicing
-        response = self.client.post(service_url, {})
-        self.assertRedirect(response, "/org/manage/")
-        self.assertIsNone(self.client.session["org_id"])
-        self.assertFalse(self.client.session["servicing"])
 
     def test_languages(self):
         settings_url = reverse("orgs.org_workspace")
@@ -3295,120 +2803,109 @@ class UserCRUDLTest(TembaTest, CRUDLTestMixin):
     def test_list(self):
         list_url = reverse("orgs.user_list")
 
-        self.assertStaffOnly(list_url)
+        # nobody can access if users feature not enabled
+        response = self.requestView(list_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
 
-        response = self.requestView(list_url, self.customer_support)
-        self.assertEqual(9, len(response.context["object_list"]))
-        self.assertEqual("/staff/users/all", response.headers[TEMBA_MENU_SELECTION])
+        self.org.features = [Org.FEATURE_USERS]
+        self.org.save(update_fields=("features",))
 
-        response = self.requestView(list_url + "?filter=beta", self.customer_support)
-        self.assertEqual(set(), set(response.context["object_list"]))
+        self.assertRequestDisallowed(list_url, [None, self.user, self.editor, self.agent])
 
-        response = self.requestView(list_url + "?filter=staff", self.customer_support)
-        self.assertEqual({self.customer_support, self.superuser}, set(response.context["object_list"]))
+        self.assertListFetch(list_url, [self.admin], context_objects=[self.admin, self.agent, self.editor, self.user])
 
-        response = self.requestView(list_url + "?search=admin@nyaruka.com", self.customer_support)
-        self.assertEqual({self.admin}, set(response.context["object_list"]))
-
-        response = self.requestView(list_url + "?search=admin@nyaruka.com", self.customer_support)
-        self.assertEqual({self.admin}, set(response.context["object_list"]))
-
-        response = self.requestView(list_url + "?search=Andy", self.customer_support)
-        self.assertEqual({self.admin}, set(response.context["object_list"]))
-
-    def test_read(self):
-        read_url = reverse("orgs.user_read", args=[self.editor.id])
-
-        # this is a customer support only view
-        self.assertStaffOnly(read_url)
-
-        response = self.requestView(read_url, self.customer_support)
-        self.assertEqual(200, response.status_code)
+        # can search by name or email
+        self.assertListFetch(list_url + "?search=andy", [self.admin], context_objects=[self.admin])
+        self.assertListFetch(list_url + "?search=editor@nyaruka.com", [self.admin], context_objects=[self.editor])
 
     def test_update(self):
-        update_url = reverse("orgs.user_update", args=[self.editor.id])
+        update_url = reverse("orgs.user_update", args=[self.agent.id])
 
-        # this is a customer support only view
-        self.assertStaffOnly(update_url)
+        # nobody can access if users feature not enabled
+        response = self.requestView(update_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
 
-        response = self.requestView(update_url, self.customer_support)
-        self.assertEqual(200, response.status_code)
+        self.org.features = [Org.FEATURE_USERS]
+        self.org.save(update_fields=("features",))
 
-        alphas = Group.objects.get(name="Alpha")
-        betas = Group.objects.get(name="Beta")
-        current_password = self.editor.password
+        self.assertRequestDisallowed(update_url, [None, self.user, self.editor, self.agent])
 
-        # submit without new password
-        response = self.requestView(
-            update_url,
-            self.customer_support,
-            post_data={
-                "email": "eddy@nyaruka.com",
-                "first_name": "Edward",
-                "last_name": "",
-                "groups": [alphas.id, betas.id],
-            },
-        )
-        self.assertEqual(302, response.status_code)
+        self.assertUpdateFetch(update_url, [self.admin], form_fields={"role": "T"})
 
-        self.editor.refresh_from_db()
-        self.assertEqual("eddy@nyaruka.com", self.editor.email)
-        self.assertEqual("eddy@nyaruka.com", self.editor.username)  # should match email
-        self.assertEqual(current_password, self.editor.password)
-        self.assertEqual("Edward", self.editor.first_name)
-        self.assertEqual("", self.editor.last_name)
-        self.assertEqual({alphas, betas}, set(self.editor.groups.all()))
+        # check can't update user not in the current org
+        self.assertRequestDisallowed(reverse("orgs.user_update", args=[self.admin2.id]), [self.admin])
 
-        # submit with new password and one less group
-        response = self.requestView(
-            update_url,
-            self.customer_support,
-            post_data={
-                "email": "eddy@nyaruka.com",
-                "new_password": "Asdf1234",
-                "first_name": "Edward",
-                "last_name": "",
-                "groups": [alphas.id],
-            },
-        )
-        self.assertEqual(302, response.status_code)
+        # role field for viewers defaults to editor
+        update_url = reverse("orgs.user_update", args=[self.user.id])
 
-        self.editor.refresh_from_db()
-        self.assertEqual("eddy@nyaruka.com", self.editor.email)
-        self.assertEqual("eddy@nyaruka.com", self.editor.username)
-        self.assertNotEqual(current_password, self.editor.password)
-        self.assertEqual("Edward", self.editor.first_name)
-        self.assertEqual("", self.editor.last_name)
-        self.assertEqual({alphas}, set(self.editor.groups.all()))
+        self.assertUpdateFetch(update_url, [self.admin], form_fields={"role": "E"})
+
+        response = self.assertUpdateSubmit(update_url, self.admin, {"role": "E"})
+        self.assertRedirect(response, reverse("orgs.user_list"))
+
+        self.assertEqual({self.user, self.editor}, set(self.org.get_users(roles=[OrgRole.EDITOR])))
+
+        # try updating ourselves...
+        update_url = reverse("orgs.user_update", args=[self.admin.id])
+
+        # can't be updated because no other admins
+        response = self.assertUpdateSubmit(update_url, self.admin, {"role": "E"}, object_unchanged=self.admin)
+        self.assertRedirect(response, reverse("orgs.user_list"))
+        self.assertEqual({self.user, self.editor}, set(self.org.get_users(roles=[OrgRole.EDITOR])))
+        self.assertEqual({self.admin}, set(self.org.get_users(roles=[OrgRole.ADMINISTRATOR])))
+
+        # add another admin to workspace and try again
+        self.org.add_user(self.admin2, OrgRole.ADMINISTRATOR)
+
+        response = self.assertUpdateSubmit(update_url, self.admin, {"role": "E"}, object_unchanged=self.admin)
+        self.assertRedirect(response, reverse("orgs.org_start"))  # no longer have access to user list page
+
+        self.assertEqual({self.user, self.editor, self.admin}, set(self.org.get_users(roles=[OrgRole.EDITOR])))
+        self.assertEqual({self.admin2}, set(self.org.get_users(roles=[OrgRole.ADMINISTRATOR])))
 
     def test_delete(self):
-        delete_url = reverse("orgs.user_delete", args=[self.editor.id])
+        delete_url = reverse("orgs.user_delete", args=[self.agent.id])
 
-        # this is a customer support only view
-        self.assertStaffOnly(delete_url)
+        # nobody can access if users feature not enabled
+        response = self.requestView(delete_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
 
-        response = self.requestView(delete_url, self.customer_support)
-        self.assertEqual(200, response.status_code)
-        self.assertNotContains(response, "Nyaruka")  # editor doesn't own this org
+        self.org.features = [Org.FEATURE_USERS]
+        self.org.save(update_fields=("features",))
 
-        # make editor the owner of the org
-        OrgMembership.objects.filter(org=self.org, role_code=OrgRole.ADMINISTRATOR.code).delete()
-        OrgMembership.objects.filter(org=self.org, role_code=OrgRole.VIEWER.code).delete()
-        OrgMembership.objects.filter(org=self.org, role_code=OrgRole.AGENT.code).delete()
-        OrgMembership.objects.filter(org=self.org, role_code=OrgRole.SURVEYOR.code).delete()
+        self.assertRequestDisallowed(delete_url, [None, self.user, self.editor, self.agent])
 
-        response = self.requestView(delete_url, self.customer_support)
-        self.assertEqual(200, response.status_code)
-        self.assertContains(response, "Nyaruka")
+        # check can't delete user not in the current org
+        self.assertRequestDisallowed(reverse("orgs.user_delete", args=[self.admin2.id]), [self.admin])
 
-        response = self.requestView(delete_url, self.customer_support, post_data={})
-        self.assertEqual(reverse("orgs.user_list"), response["Temba-Success"])
+        response = self.assertDeleteFetch(delete_url, [self.admin], as_modal=True)
+        self.assertContains(
+            response, "You are about to remove the user <b>Agnes</b> from your workspace. Are you sure?"
+        )
 
-        self.editor.refresh_from_db()
-        self.assertFalse(self.editor.is_active)
+        # submitting the delete doesn't actually delete the user - only removes them from the org
+        response = self.assertDeleteSubmit(delete_url, self.admin, object_unchanged=self.agent)
 
-        self.org.refresh_from_db()
-        self.assertFalse(self.org.is_active)
+        self.assertRedirect(response, reverse("orgs.user_list"))
+        self.assertEqual({self.user, self.editor, self.admin}, set(self.org.get_users()))
+
+        # try deleting ourselves..
+        delete_url = reverse("orgs.user_delete", args=[self.admin.id])
+
+        # can't be removed because no other admins
+        response = self.assertDeleteSubmit(delete_url, self.admin, object_unchanged=self.admin)
+        self.assertRedirect(response, reverse("orgs.user_list"))
+        self.assertEqual({self.user, self.editor, self.admin}, set(self.org.get_users()))
+
+        # add another admin to workspace and try again
+        self.org.add_user(self.admin2, OrgRole.ADMINISTRATOR)
+
+        response = self.assertDeleteSubmit(delete_url, self.admin, object_unchanged=self.admin)
+
+        # this time we could remove ourselves
+        response = self.assertDeleteSubmit(delete_url, self.admin, object_unchanged=self.admin)
+        self.assertRedirect(response, reverse("orgs.org_choose"))
+        self.assertEqual({self.user, self.editor, self.admin2}, set(self.org.get_users()))
 
     def test_account(self):
         self.login(self.agent)
@@ -3419,7 +2916,7 @@ class UserCRUDLTest(TembaTest, CRUDLTestMixin):
         self.login(self.admin)
 
         response = self.client.get(reverse("orgs.user_account"))
-        self.assertEqual(2, len(response.context["formax"].sections))
+        self.assertEqual(1, len(response.context["formax"].sections))
 
     def test_edit(self):
         edit_url = reverse("orgs.user_edit")
@@ -3613,13 +3110,7 @@ class UserCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertRedirect(response, forget_url, status_code=301)
 
         FailedLogin.objects.create(username="admin@nyaruka.com")
-        invitation = Invitation.objects.create(
-            org=self.org,
-            user_group="A",
-            email="invited@nyaruka.com",
-            created_by=self.admin,
-            modified_by=self.admin,
-        )
+        invitation = Invitation.create(self.org, self.admin, "invited@nyaruka.com", OrgRole.ADMINISTRATOR)
 
         # no login required to access
         response = self.client.get(forget_url)
@@ -3746,25 +3237,38 @@ class UserCRUDLTest(TembaTest, CRUDLTestMixin):
         self.assertEqual(0, FailedLogin.objects.filter(username="admin@nyaruka.com").count())  # deleted
         self.assertEqual(1, FailedLogin.objects.filter(username="editor@nyaruka.com").count())  # unaffected
 
-    def test_token(self):
-        token_url = reverse("orgs.user_token")
+    def test_tokens(self):
+        tokens_url = reverse("orgs.user_tokens")
 
-        self.assertRequestDisallowed(token_url, [None, self.user, self.agent])
+        self.assertRequestDisallowed(tokens_url, [None, self.user, self.agent])
+        self.assertReadFetch(tokens_url, [self.admin], context_object=self.admin)
 
-        self.login(self.editor)
+        # add user to other org and create API tokens for both
+        self.org2.add_user(self.admin, OrgRole.EDITOR)
+        token1 = APIToken.create(self.org, self.admin)
+        token2 = APIToken.create(self.org, self.admin)
+        APIToken.create(self.org, self.editor)  # other user
+        APIToken.create(self.org2, self.admin)  # other org
 
-        editor_token = self.editor.get_api_token(self.org)
+        response = self.assertReadFetch(tokens_url, [self.admin], context_object=self.admin, choose_org=self.org)
+        self.assertEqual([token1, token2], list(response.context["tokens"]))
+        self.assertContentMenu(tokens_url, self.admin, ["New Token"], choose_org=self.org)
 
-        response = self.client.get(token_url)
-        self.assertContains(response, editor_token)
+        # can POST to create new token
+        response = self.client.post(tokens_url, {"new": "1"})
+        self.assertRedirect(response, reverse("orgs.user_tokens"))
+        self.assertEqual(3, self.admin.get_api_tokens(self.org).count())
+        token3 = self.admin.get_api_tokens(self.org).order_by("created").last()
 
-        # a post should refresh the token
-        response = self.client.post(token_url, {}, follow=True)
-        self.assertNotContains(response, editor_token)
+        # and now option to create new token is gone because we've reached the limit
+        response = self.assertReadFetch(tokens_url, [self.admin], context_object=self.admin, choose_org=self.org)
+        self.assertEqual([token1, token2, token3], list(response.context["tokens"]))
+        self.assertContentMenu(tokens_url, self.admin, [], choose_org=self.org)
 
-        new_token = self.editor.get_api_token(self.org)
-
-        self.assertContains(response, new_token)
+        # and POSTing is noop
+        response = self.client.post(tokens_url, {"new": "1"})
+        self.assertRedirect(response, reverse("orgs.user_tokens"))
+        self.assertEqual(3, self.admin.get_api_tokens(self.org).count())
 
     def test_verify_email(self):
         self.assertEqual(self.admin.settings.email_status, "U")
@@ -3871,9 +3375,7 @@ class BulkExportTest(TembaTest):
         export = DefinitionExport.create(self.org, self.admin, flows=flows, campaigns=campaigns)
         export.perform()
 
-        filename = f"{settings.MEDIA_ROOT}/test_orgs/{self.org.id}/definition_exports/{export.uuid}.json"
-
-        with open(filename) as export_file:
+        with default_storage.open(f"orgs/{self.org.id}/definition_exports/{export.uuid}.json") as export_file:
             definitions = json.loads(export_file.read())
 
         return definitions, export
@@ -3894,7 +3396,7 @@ class BulkExportTest(TembaTest):
     def test_trigger_dependency(self):
         # tests the case of us doing an export of only a single flow (despite dependencies) and making sure we
         # don't include the triggers of our dependent flows (which weren't exported)
-        self.import_file("parent_child_trigger")
+        self.import_file("test_flows/parent_child_trigger.json")
 
         parent = Flow.objects.filter(name="Parent Flow").first()
 
@@ -3906,7 +3408,7 @@ class BulkExportTest(TembaTest):
         self.assertFalse(exported["triggers"])
 
     def test_subflow_dependencies(self):
-        self.import_file("subflow")
+        self.import_file("test_flows/subflow.json")
 
         parent = Flow.objects.filter(name="Parent Flow").first()
         child = Flow.objects.filter(name="Child Flow").first()
@@ -3986,7 +3488,7 @@ class BulkExportTest(TembaTest):
             self.assertIsNone(Flow.objects.filter(org=self.org, name="New Mother").first())
 
     def test_import_campaign_with_translations(self):
-        self.import_file("campaign_import_with_translations")
+        self.import_file("test_flows/campaign_import_with_translations.json")
 
         campaign = Campaign.objects.all().first()
         event = campaign.events.all().first()
@@ -4004,7 +3506,7 @@ class BulkExportTest(TembaTest):
         self.assertEqual(flow_def["localization"]["eng"][action["uuid"]]["text"], ["Hey"])
 
     def test_reimport(self):
-        self.import_file("survey_campaign")
+        self.import_file("test_flows/survey_campaign.json")
 
         campaign = Campaign.objects.filter(is_active=True).last()
         event = campaign.events.filter(is_active=True).last()
@@ -4014,7 +3516,7 @@ class BulkExportTest(TembaTest):
         campaign.group.contacts.add(sally)
 
         # importing it again shouldn't result in failures
-        self.import_file("survey_campaign")
+        self.import_file("test_flows/survey_campaign.json")
 
         # get our latest campaign and event
         new_campaign = Campaign.objects.filter(is_active=True).last()
@@ -4025,7 +3527,7 @@ class BulkExportTest(TembaTest):
         self.assertNotEqual(event.id, new_event.id)
 
     def test_import_mixed_flow_versions(self):
-        self.import_file("mixed_versions")
+        self.import_file("test_flows/mixed_versions.json")
 
         group = ContactGroup.objects.get(name="Survey Audience")
 
@@ -4044,7 +3546,7 @@ class BulkExportTest(TembaTest):
         self.assertEqual(dep_graph[parent], {child})
 
     def test_import_dependency_types(self):
-        self.import_file("all_dependency_types")
+        self.import_file("test_flows/all_dependency_types.json")
 
         parent = Flow.objects.get(name="All Dep Types")
         child = Flow.objects.get(name="New Child")
@@ -4074,7 +3576,7 @@ class BulkExportTest(TembaTest):
         # final call is after new flows and dependencies have been committed so mailroom can see them
         mr_mocks.flow_inspect(dependencies=[{"key": "age", "name": "", "type": "field", "missing": False}])
 
-        self.import_file("color")
+        self.import_file("test_flows/color.json")
 
         flow = Flow.objects.get()
 
@@ -4082,7 +3584,7 @@ class BulkExportTest(TembaTest):
 
     def test_import_missing_flow_dependency(self):
         # in production this would blow up validating the flow but we can't do that during tests
-        self.import_file("parent_without_its_child")
+        self.import_file("test_flows/parent_without_its_child.json")
 
         parent = Flow.objects.get(name="Single Parent")
         self.assertEqual(set(parent.flow_dependencies.all()), set())
@@ -4090,7 +3592,7 @@ class BulkExportTest(TembaTest):
         # create child with that name and re-import
         child1 = Flow.create(self.org, self.admin, "New Child", Flow.TYPE_MESSAGE)
 
-        self.import_file("parent_without_its_child")
+        self.import_file("test_flows/parent_without_its_child.json")
         self.assertEqual(set(parent.flow_dependencies.all()), {child1})
 
         # create child with that UUID and re-import
@@ -4098,7 +3600,7 @@ class BulkExportTest(TembaTest):
             self.org, self.admin, "New Child 2", Flow.TYPE_MESSAGE, uuid="a925453e-ad31-46bd-858a-e01136732181"
         )
 
-        self.import_file("parent_without_its_child")
+        self.import_file("test_flows/parent_without_its_child.json")
         self.assertEqual(set(parent.flow_dependencies.all()), {child2})
 
     def validate_flow_dependencies(self, definition):
@@ -4125,7 +3627,7 @@ class BulkExportTest(TembaTest):
         """
         Tests importing flow definitions without fields and groups included in the export
         """
-        data = self.get_import_json("cataclysm")
+        data = self.load_json("test_flows/cataclysm.json")
 
         del data["fields"]
         del data["groups"]
@@ -4147,7 +3649,7 @@ class BulkExportTest(TembaTest):
         """
         Tests importing flow definitions with groups included in the export but not fields
         """
-        data = self.get_import_json("cataclysm")
+        data = self.load_json("test_flows/cataclysm.json")
         del data["fields"]
 
         mr_mocks.contact_parse_query("facts_per_day = 1", fields=["facts_per_day"])
@@ -4190,7 +3692,7 @@ class BulkExportTest(TembaTest):
         mr_mocks.contact_parse_query("facts_per_day = 1", fields=["facts_per_day"])
         mr_mocks.contact_parse_query("likes_cats = true", cleaned='likes_cats = "true"', fields=["likes_cats"])
 
-        self.import_file("cataclysm")
+        self.import_file("test_flows/cataclysm.json")
 
         flow = Flow.objects.get(name="Cataclysmic")
         self.validate_flow_dependencies(flow.get_definition())
@@ -4235,7 +3737,7 @@ class BulkExportTest(TembaTest):
             self.org, self.admin, Trigger.TYPE_KEYWORD, flow2, keywords=["rating"], match_type=Trigger.MATCH_FIRST_WORD
         )
 
-        data = self.get_import_json("rating_10")
+        data = self.load_json("test_flows/rating_10.json")
 
         self.org.import_app(data, self.admin, site="http://rapidpro.io")
 
@@ -4257,7 +3759,7 @@ class BulkExportTest(TembaTest):
         flow_trigger.archive(self.admin)
 
         # re import again will restore the trigger
-        data = self.get_import_json("rating_10")
+        data = self.load_json("test_flows/rating_10.json")
         self.org.import_app(data, self.admin, site="http://rapidpro.io")
 
         flow_trigger.refresh_from_db()
@@ -4305,7 +3807,7 @@ class BulkExportTest(TembaTest):
             )
 
         # import all our bits
-        self.import_file("the_clinic")
+        self.import_file("test_flows/the_clinic.json")
 
         confirm_appointment = Flow.objects.get(name="Confirm Appointment")
         self.assertEqual(10080, confirm_appointment.expires_after_minutes)
@@ -4327,7 +3829,7 @@ class BulkExportTest(TembaTest):
         message_flow.update_single_message_flow(self.admin, {"eng": "No reminders for you!"}, base_language="eng")
 
         # now reimport
-        self.import_file("the_clinic")
+        self.import_file("test_flows/the_clinic.json")
 
         # our flow should get reset from the import
         confirm_appointment.refresh_from_db()
@@ -4535,8 +4037,29 @@ class BulkExportTest(TembaTest):
 
 
 class InvitationCRUDLTest(TembaTest, CRUDLTestMixin):
+    def test_list(self):
+        list_url = reverse("orgs.invitation_list")
+
+        # nobody can access if users feature not enabled
+        response = self.requestView(list_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
+
+        self.org.features = [Org.FEATURE_USERS]
+        self.org.save(update_fields=("features",))
+
+        self.assertRequestDisallowed(list_url, [None, self.user, self.editor, self.agent])
+
+        inv1 = Invitation.create(self.org, self.admin, "bob@nyaruka.com", OrgRole.EDITOR)
+        inv2 = Invitation.create(self.org, self.admin, "jim@nyaruka.com", OrgRole.AGENT)
+
+        self.assertListFetch(list_url, [self.admin], context_objects=[inv2, inv1])
+
     def test_create(self):
         create_url = reverse("orgs.invitation_create")
+
+        # nobody can access if users feature not enabled
+        response = self.requestView(create_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
 
         self.org.features = [Org.FEATURE_CHILD_ORGS, Org.FEATURE_USERS]
         self.org.save(update_fields=("features",))
@@ -4570,7 +4093,7 @@ class InvitationCRUDLTest(TembaTest, CRUDLTestMixin):
             create_url,
             self.admin,
             {"email": "newguy@nyaruka.com", "role": "A"},
-            new_obj_query=Invitation.objects.filter(org=self.org, email="newguy@nyaruka.com", user_group="A").exclude(
+            new_obj_query=Invitation.objects.filter(org=self.org, email="newguy@nyaruka.com", role_code="A").exclude(
                 secret=None
             ),
         )
@@ -4586,26 +4109,30 @@ class InvitationCRUDLTest(TembaTest, CRUDLTestMixin):
             form_errors={"email": "User has already been invited to this workspace."},
         )
 
-        # view can create invitations in child orgs
-        child1 = self.org.create_new(self.admin, "Child 1", tzone.utc, as_child=True)
-        child1.features = [Org.FEATURE_USERS]
-        child1.save(update_fields=("features",))
+    def test_delete(self):
+        inv1 = Invitation.create(self.org, self.admin, "bob@nyaruka.com", OrgRole.EDITOR)
+        inv2 = Invitation.create(self.org, self.admin, "jim@nyaruka.com", OrgRole.AGENT)
 
-        self.org.create_new(self.admin, "Child 2", tzone.utc, as_child=True)
+        delete_url = reverse("orgs.invitation_delete", args=[inv1.id])
 
-        self.assertCreateSubmit(
-            create_url + f"?org={child1.id}",
-            self.admin,
-            {"email": "newguy@nyaruka.com", "role": "A"},
-            new_obj_query=Invitation.objects.filter(org=child1, email="newguy@nyaruka.com", user_group="A").exclude(
-                secret=None
-            ),
+        # nobody can access if users feature not enabled
+        response = self.requestView(delete_url, self.admin)
+        self.assertRedirect(response, reverse("orgs.org_workspace"))
+
+        self.org.features = [Org.FEATURE_USERS]
+        self.org.save(update_fields=("features",))
+
+        self.assertRequestDisallowed(delete_url, [None, self.user, self.editor, self.agent])
+
+        response = self.assertDeleteFetch(delete_url, [self.admin], as_modal=True)
+        self.assertContains(
+            response, "You are about to cancel the invitation sent to <b>bob@nyaruka.com</b>. Are you sure?"
         )
-        self.assertEqual(2, len(mail.outbox))
 
-        # view can't create invitations in other orgs
-        response = self.client.get(create_url + f"?org={self.org2.id}")
-        self.assertEqual(404, response.status_code)
+        response = self.assertDeleteSubmit(delete_url, self.admin, object_deactivated=inv1)
+
+        self.assertRedirect(response, reverse("orgs.invitation_list"))
+        self.assertEqual({inv2}, set(self.org.invitations.filter(is_active=True)))
 
 
 class BackupTokenTest(TembaTest):
@@ -4662,16 +4189,11 @@ class ExportCRUDLTest(TembaTest):
         self.assertEqual(1, self.admin.notifications.filter(notification_type="export:finished", is_seen=False).count())
 
         download_url = reverse("orgs.export_download", kwargs={"uuid": export.uuid})
-
         self.assertEqual(f"/export/download/{export.uuid}/", download_url)
-        self.assertEqual(
-            (
-                f"/media/test_orgs/{self.org.id}/ticket_exports/{export.uuid}.xlsx",
-                f"tickets_{datetime.today().strftime(r'%Y%m%d')}.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ),
-            export.get_raw_access(),
-        )
+
+        raw_url = export.get_raw_url()
+        self.assertIn(f"{settings.STORAGE_URL}/orgs/{self.org.id}/ticket_exports/{export.uuid}.xlsx", raw_url)
+        self.assertIn(f"tickets_{datetime.today().strftime(r'%Y%m%d')}.xlsx", raw_url)
 
         response = self.client.get(download_url)
         self.assertLoginRedirect(response)
@@ -4690,7 +4212,4 @@ class ExportCRUDLTest(TembaTest):
         self.assertEqual(0, self.admin.notifications.filter(notification_type="export:finished", is_seen=False).count())
 
         response = self.client.get(download_url + "?raw=1")
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", response.headers["content-type"]
-        )
+        self.assertRedirect(response, f"/test-default/orgs/{self.org.id}/ticket_exports/{export.uuid}.xlsx")

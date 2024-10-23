@@ -1,6 +1,5 @@
 import itertools
 import logging
-import mimetypes
 import os
 from abc import ABCMeta
 from collections import defaultdict
@@ -16,7 +15,6 @@ import pyotp
 import pytz
 from packaging.version import Version
 from smartmin.models import SmartModel
-from storages.backends.s3boto3 import S3Boto3Storage
 from timezone_field import TimeZoneField
 
 from django.conf import settings
@@ -148,6 +146,8 @@ class User(AuthUser):
 
     @classmethod
     def create(cls, email: str, first_name: str, last_name: str, password: str, language: str = None):
+        assert not cls.get_by_email(email), "user with this email already exists"
+
         obj = cls.objects.create_user(
             username=email, email=email, first_name=first_name, last_name=last_name, password=password
         )
@@ -158,7 +158,7 @@ class User(AuthUser):
 
     @classmethod
     def get_or_create(cls, email: str, first_name: str, last_name: str, password: str, language: str = None):
-        obj = cls.objects.filter(username__iexact=email).first()
+        obj = cls.get_by_email(email)
         if obj:
             obj.first_name = first_name
             obj.last_name = last_name
@@ -166,6 +166,10 @@ class User(AuthUser):
             return obj
 
         return cls.create(email, first_name, last_name, password=password, language=language)
+
+    @classmethod
+    def get_by_email(cls, email: str):
+        return cls.objects.filter(username__iexact=email).first()
 
     @classmethod
     def get_orgs_for_request(cls, request):
@@ -198,13 +202,6 @@ class User(AuthUser):
             if not org.users.exclude(id=self.id).exists():
                 owned_orgs.append(org)
         return owned_orgs
-
-    def set_team(self, team):
-        """
-        Sets the ticketing team for this user
-        """
-        self.settings.team = team
-        self.settings.save(update_fields=("team",))
 
     def record_auth(self):
         """
@@ -275,14 +272,11 @@ class User(AuthUser):
 
         return role.has_perm(permission)
 
-    def get_api_token(self, org) -> str:
-        from temba.api.models import APIToken
-
-        try:
-            token = APIToken.get_or_create(org, self)
-            return token.key
-        except ValueError:
-            return None
+    def get_api_tokens(self, org):
+        """
+        Gets this users active API tokens for the given org
+        """
+        return self.api_tokens.filter(org=org, is_active=True)
 
     def as_engine_ref(self) -> dict:
         return {"email": self.email, "name": self.name}
@@ -299,6 +293,9 @@ class User(AuthUser):
         self.password = ""
         self.is_active = False
         self.save()
+
+        # release any API tokens
+        self.api_tokens.update(is_active=False)
 
         # release any orgs we own
         for org in self.get_owned_orgs():
@@ -317,13 +314,12 @@ class User(AuthUser):
 
 class UserSettings(models.Model):
     """
-    Custom fields for users
+    Additional non-org specific fields for users
     """
 
     STATUS_UNVERIFIED = "U"
     STATUS_VERIFIED = "V"
     STATUS_FAILING = "F"
-
     STATUS_CHOICES = (
         (STATUS_UNVERIFIED, _("Unverified")),
         (STATUS_VERIFIED, _("Verified")),
@@ -332,7 +328,6 @@ class UserSettings(models.Model):
 
     user = models.OneToOneField(User, on_delete=models.PROTECT, related_name="settings")
     language = models.CharField(max_length=8, choices=settings.LANGUAGES, default=settings.DEFAULT_LANGUAGE)
-    team = models.ForeignKey("tickets.Team", on_delete=models.PROTECT, null=True)
     otp_secret = models.CharField(max_length=16, default=pyotp.random_base32)
     two_factor_enabled = models.BooleanField(default=False)
     last_auth_on = models.DateTimeField(null=True)
@@ -358,7 +353,6 @@ class OrgRole(Enum):
     EDITOR = ("E", _("Editor"), _("Editors"), "Editors", "msgs.msg_inbox")
     VIEWER = ("V", _("Viewer"), _("Viewers"), "Viewers", "msgs.msg_inbox")
     AGENT = ("T", _("Agent"), _("Agents"), "Agents", "tickets.ticket_list")
-    SURVEYOR = ("S", _("Surveyor"), _("Surveyors"), "Surveyors", "users.login")
 
     def __init__(self, code: str, display: str, display_plural: str, group_name: str, start_view: str):
         self.code = code
@@ -396,6 +390,10 @@ class OrgRole(Enum):
     @cached_property
     def api_permissions(self) -> set:
         return set(settings.API_PERMISSIONS.get(self.group_name, ()))
+
+    @classmethod
+    def choices(cls):
+        return [(r.code, r.display) for r in cls if r != cls.VIEWER]
 
     def has_perm(self, permission: str) -> bool:
         """
@@ -458,12 +456,10 @@ class Org(SmartModel):
     CURRENT_EXPORT_VERSION = "13"
 
     FEATURE_USERS = "users"  # can invite users to this org
-    FEATURE_VIEWERS = "viewers"  # users with read-only Viewer role
     FEATURE_NEW_ORGS = "new_orgs"  # can create new workspace with same login
     FEATURE_CHILD_ORGS = "child_orgs"  # can create child workspaces of this org
     FEATURES_CHOICES = (
         (FEATURE_USERS, _("Users")),
-        (FEATURE_VIEWERS, _("Viewers")),
         (FEATURE_NEW_ORGS, _("New Orgs")),
         (FEATURE_CHILD_ORGS, _("Child Orgs")),
     )
@@ -514,6 +510,7 @@ class Org(SmartModel):
     flow_languages = ArrayField(models.CharField(max_length=3), default=list, validators=[ArrayMinLengthValidator(1)])
     input_collation = models.CharField(max_length=32, choices=COLLATION_CHOICES, default=COLLATION_DEFAULT)
     flow_smtp = models.CharField(null=True)  # e.g. smtp://...
+    prometheus_token = models.CharField(null=True, max_length=40)
 
     config = models.JSONField(default=dict)
     slug = models.SlugField(
@@ -534,10 +531,6 @@ class Org(SmartModel):
     )
     is_flagged = models.BooleanField(default=False, help_text=_("Whether this organization is currently flagged."))
     is_suspended = models.BooleanField(default=False, help_text=_("Whether this organization is currently suspended."))
-
-    surveyor_password = models.CharField(
-        null=True, max_length=128, default=None, help_text=_("A password that allows users to register as surveyors")
-    )
 
     # when this org was released and when it was actually deleted
     released_on = models.DateTimeField(null=True)
@@ -845,6 +838,44 @@ class Org(SmartModel):
     def supports_ivr(self):
         return self.get_call_channel() or self.get_answer_channel()
 
+    def is_outbox_full(self) -> bool:
+        from temba.msgs.models import SystemLabel
+
+        return SystemLabel.get_counts(self)[SystemLabel.TYPE_OUTBOX] >= 1_000_000
+
+    def get_estimated_send_time(self, msg_count):
+        """
+        Estimates the time it will take to send the given number of messages
+        """
+        channels = self.channels.filter(is_active=True)
+        channel_counts = {}
+        month_ago = timezone.now() - timedelta(days=30)
+        total_count = 0
+
+        for channel in channels:
+            channel_count = channel.get_msg_count(since=month_ago)
+            total_count += channel_count
+            channel_counts[channel.uuid] = {"count": channel_count, "tps": channel.tps or 10}
+
+        # balance all channels equally if we have nothing to go on
+        if not total_count:
+            for channel_uuid in channel_counts:
+                channel_counts[channel_uuid]["count"] = 1
+            total_count = len(channel_counts)
+
+        # calculate pct of messages that will go to each channel
+        for channel_uuid, channel_count in channel_counts.items():
+            pct = channel_count["count"] / total_count
+            channel_counts[channel_uuid]["time"] = pct * msg_count / channel_count["tps"]
+
+        longest_time = 0
+        if channel_counts:
+            longest_time = max(
+                [channel_count["time"] if "time" in channel_count else 0 for channel_count in channel_counts.values()]
+            )
+
+        return timedelta(seconds=longest_time)
+
     def get_channel(self, role: str, scheme: str):
         """
         Gets a channel for this org which supports the given role and scheme
@@ -997,20 +1028,6 @@ class Org(SmartModel):
         format = formats[1] if show_time else formats[0]
         return datetime_to_str(d, format, self.timezone)
 
-    def get_allowed_user_roles(self) -> list[OrgRole]:
-        """
-        Gets the allowed user roles which always includes any roles in use (can't take away roles).
-        """
-        roles = [r for r in OrgRole]
-        codes_in_use = set(OrgMembership.objects.filter(org=self).values_list("role_code", flat=True).distinct())
-
-        if "surveyor" not in settings.FEATURES and OrgRole.SURVEYOR.code not in codes_in_use:
-            roles.remove(OrgRole.SURVEYOR)
-        if Org.FEATURE_VIEWERS not in self.features and OrgRole.VIEWER.code not in codes_in_use:
-            roles.remove(OrgRole.VIEWER)
-
-        return roles
-
     def get_users(self, *, roles: list = None, with_perm: str = None):
         """
         Gets users in this org, filtered by role or permission.
@@ -1040,14 +1057,19 @@ class Org(SmartModel):
         """
         return self.users.filter(id=user.id).exists()
 
-    def add_user(self, user: User, role: OrgRole):
+    def add_user(self, user: User, role: OrgRole, *, team=None):
         """
         Adds the given user to this org with the given role
         """
+
+        assert role in OrgRole, f"invalid role: {role}"
+        assert role == OrgRole.AGENT or not team, "only agent users can be assigned to a team"
+        assert not team or team.org == self, "team must belong to this org"
+
         if self.has_user(user):  # remove user from any existing roles
             self.remove_user(user)
 
-        self.users.add(user, through_defaults={"role_code": role.code})
+        self.users.add(user, through_defaults={"role_code": role.code, "team": team})
         self._user_role_cache[user] = role
 
     def remove_user(self, user: User):
@@ -1321,7 +1343,8 @@ class Org(SmartModel):
 
         # delete our contacts
         for contact in self.contacts.all():
-            contact.release(user, immediately=True)
+            # release synchronously and don't deindex as that will happen for the whole org
+            contact.release(user, immediately=True, deindex=False)
             contact.delete()
             counts["contacts"] += 1
 
@@ -1373,11 +1396,13 @@ class Org(SmartModel):
         # needs to come after deletion of msgs and broadcasts as those insert new counts
         delete_in_batches(self.system_labels.all())
 
+        # now that contacts are no longer in the database, we can start de-indexing them from search
+        mailroom.get_client().org_deindex(self)
+
         # save when we were actually deleted
         self.modified_on = timezone.now()
         self.deleted_on = timezone.now()
         self.config = {}
-        self.surveyor_password = None
         self.save()
 
         return counts
@@ -1398,7 +1423,7 @@ class Org(SmartModel):
         }
 
     def __repr__(self):
-        return f'<Org: name="{self.name}">'
+        return f'<Org: id={self.id} name="{self.name}">'
 
     def __str__(self):
         return self.name
@@ -1408,6 +1433,7 @@ class OrgMembership(models.Model):
     org = models.ForeignKey(Org, on_delete=models.CASCADE)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     role_code = models.CharField(max_length=1)
+    team = models.ForeignKey("tickets.Team", on_delete=models.PROTECT, null=True)
 
     @property
     def role(self):
@@ -1419,7 +1445,7 @@ class OrgMembership(models.Model):
 
 def get_import_upload_path(instance: Any, filename: str):
     ext = Path(filename).suffix.lower()
-    return f"{settings.STORAGE_ROOT_DIR}/{instance.org_id}/org_imports/{uuid4()}{ext}"
+    return f"orgs/{instance.org_id}/org_imports/{uuid4()}{ext}"
 
 
 class OrgImport(SmartModel):
@@ -1472,12 +1498,19 @@ class Invitation(SmartModel):
     An invitation to an e-mail address to join an org as a specific role.
     """
 
-    ROLE_CHOICES = [(r.code, r.display) for r in OrgRole]
-
     org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="invitations")
     email = models.EmailField()
     secret = models.CharField(max_length=64, unique=True)
-    user_group = models.CharField(max_length=1, choices=ROLE_CHOICES, default=OrgRole.VIEWER.code)
+    role_code = models.CharField(max_length=1, choices=OrgRole.choices(), default=OrgRole.EDITOR.code)
+    team = models.ForeignKey("tickets.Team", on_delete=models.PROTECT, null=True)
+
+    @classmethod
+    def create(cls, org, user, email: str, role: OrgRole, team=None):
+        assert not team or org == team.org
+
+        return cls.objects.create(
+            org=org, email=email, role_code=role.code, team=team, created_by=user, modified_by=user
+        )
 
     def save(self, *args, **kwargs):
         if not self.secret:
@@ -1487,7 +1520,7 @@ class Invitation(SmartModel):
 
     @property
     def role(self):
-        return OrgRole.from_code(self.user_group)
+        return OrgRole.from_code(self.role_code)
 
     def send(self):
         sender = EmailSender.from_email_type(self.org.branding, "notifications")
@@ -1498,10 +1531,20 @@ class Invitation(SmartModel):
             {"org": self.org, "invitation": self},
         )
 
-    def release(self):
+    def accept(self, user):
+        from temba.notifications.types.builtin import InvitationAcceptedNotificationType
+
+        self.org.add_user(user, self.role)
+
+        InvitationAcceptedNotificationType.create(self)
+
+        self.release()
+
+    def release(self, user=None):
         self.is_active = False
         self.modified_on = timezone.now()
-        self.save(update_fields=("is_active", "modified_on"))
+        self.modified_by = user or self.modified_by
+        self.save(update_fields=("is_active", "modified_by", "modified_on"))
 
 
 class BackupToken(models.Model):
@@ -1665,8 +1708,7 @@ class Export(TembaUUIDMixin, models.Model):
             temp_file, extension, num_records = self.type.write(self)
 
             # save file to storage
-            directory = os.path.join(settings.STORAGE_ROOT_DIR, str(self.org.id), self.type.slug + "_exports")
-            path = f"{directory}/{self.uuid}.{extension}"
+            path = f"orgs/{self.org.id}/{self.type.slug}_exports/{self.uuid}.{extension}"
             default_storage.save(path, File(temp_file))
 
             # remove temporary file
@@ -1773,23 +1815,19 @@ class Export(TembaUUIDMixin, models.Model):
     def type(self):
         return self._get_types()[self.export_type]
 
-    def get_raw_access(self) -> tuple[str]:
+    def get_raw_url(self) -> tuple[str]:
         """
-        Gets a tuple of 1) raw storage URL, 2) a friendly filename and 3) its MIME type
+        Gets the raw storage URL
         """
 
         filename = self._get_download_filename()
+        url = default_storage.url(
+            self.path,
+            parameters=dict(ResponseContentDisposition=f"attachment;filename={filename}"),
+            http_method="GET",
+        )
 
-        if isinstance(default_storage, S3Boto3Storage):  # pragma: needs cover
-            url = default_storage.url(
-                self.path,
-                parameters=dict(ResponseContentDisposition=f"attachment;filename={filename}"),
-                http_method="GET",
-            )
-        else:
-            url = default_storage.url(self.path)
-
-        return url, filename, mimetypes.guess_type(self.path)[0]
+        return url
 
     def _get_download_filename(self):
         """
@@ -1813,3 +1851,6 @@ class Export(TembaUUIDMixin, models.Model):
             default_storage.delete(self.path)
 
         super().delete()
+
+    def __repr__(self):  # pragma: no cover
+        return f'<Export: id={self.id} type="{self.export_type}">'

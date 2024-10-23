@@ -11,13 +11,7 @@ from temba.utils import json
 
 from .. import modifiers
 from .client import MailroomClient
-from .exceptions import (
-    EmptyBroadcastException,
-    FlowValidationException,
-    QueryValidationException,
-    RequestException,
-    URNValidationException,
-)
+from .exceptions import FlowValidationException, QueryValidationException, RequestException, URNValidationException
 from .types import ContactSpec, Exclusions, Inclusions, RecipientsPreview, ScheduleSpec, URNResult
 
 
@@ -87,6 +81,23 @@ class MailroomClientTest(TembaTest):
         )
 
     @patch("requests.post")
+    def test_android_sync(self, mock_post):
+        mock_post.return_value = MockJsonResponse(200, {"id": 12345})
+        response = self.client.android_sync(
+            channel=self.channel,
+        )
+
+        self.assertEqual({"id": 12345}, response)
+
+        mock_post.assert_called_once_with(
+            "http://localhost:8090/mr/android/sync",
+            headers={"User-Agent": "Temba", "Authorization": "Token sesame"},
+            json={
+                "channel_id": self.channel.id,
+            },
+        )
+
+    @patch("requests.post")
     def test_contact_create(self, mock_post):
         ann = self.create_contact("Ann", urns=["tel:+12340000001"])
         bob = self.create_contact("Bob", urns=["tel:+12340000002"])
@@ -94,7 +105,7 @@ class MailroomClientTest(TembaTest):
 
         # try with empty contact spec
         result = self.client.contact_create(
-            self.org, self.admin, ContactSpec(name="", language="", urns=[], fields={}, groups=[])
+            self.org, self.admin, ContactSpec(name="", language="", status="", urns=[], fields={}, groups=[])
         )
 
         self.assertEqual(ann, result)
@@ -104,7 +115,7 @@ class MailroomClientTest(TembaTest):
             json={
                 "org_id": self.org.id,
                 "user_id": self.admin.id,
-                "contact": {"name": "", "language": "", "urns": [], "fields": {}, "groups": []},
+                "contact": {"name": "", "language": "", "status": "", "urns": [], "fields": {}, "groups": []},
             },
         )
 
@@ -117,6 +128,7 @@ class MailroomClientTest(TembaTest):
             ContactSpec(
                 name="Bob",
                 language="eng",
+                status="active",
                 urns=["tel:+123456789"],
                 fields={"age": "39", "gender": "M"},
                 groups=["d5b1770f-0fb6-423b-86a0-b4d51096b99a"],
@@ -133,11 +145,27 @@ class MailroomClientTest(TembaTest):
                 "contact": {
                     "name": "Bob",
                     "language": "eng",
+                    "status": "active",
                     "urns": ["tel:+123456789"],
                     "fields": {"age": "39", "gender": "M"},
                     "groups": ["d5b1770f-0fb6-423b-86a0-b4d51096b99a"],
                 },
             },
+        )
+
+    @patch("requests.post")
+    def test_contact_deindex(self, mock_post):
+        ann = self.create_contact("Ann", urns=["tel:+12340000001"])
+        bob = self.create_contact("Bob", urns=["tel:+12340000002"])
+        mock_post.return_value = MockJsonResponse(200, {"deindexed": 2})
+        response = self.client.contact_deindex(self.org, [ann, bob])
+
+        self.assertEqual({"deindexed": 2}, response)
+
+        mock_post.assert_called_once_with(
+            "http://localhost:8090/mr/contact/deindex",
+            headers={"User-Agent": "Temba", "Authorization": "Token sesame"},
+            json={"org_id": self.org.id, "contact_ids": [ann.id, bob.id]},
         )
 
     @patch("requests.post")
@@ -291,7 +319,6 @@ class MailroomClientTest(TembaTest):
                 "query": 'name ~ "frank"',
                 "contact_ids": [1, 2],
                 "total": 2,
-                "offset": 0,
                 "metadata": {"attributes": ["name"]},
             },
         )
@@ -307,8 +334,9 @@ class MailroomClientTest(TembaTest):
                 "org_id": self.org.id,
                 "group_id": group.id,
                 "exclude_ids": (),
-                "offset": 0,
                 "sort": "-created_on",
+                "offset": 0,
+                "limit": 50,
             },
         )
 
@@ -429,6 +457,7 @@ class MailroomClientTest(TembaTest):
         group = self.create_group("Doctors", contacts=[])
         optin = self.create_optin("Cat Facts")
         bcast = self.create_broadcast(self.admin, {"eng": {"text": "Hello"}}, groups=[group])
+        template = self.create_template("reminder", [])
 
         mock_post.return_value = MockJsonResponse(200, {"id": bcast.id})
         result = self.client.msg_broadcast(
@@ -443,6 +472,8 @@ class MailroomClientTest(TembaTest):
             "",
             Exclusions(in_a_flow=True),
             optin,
+            template,
+            ["@contact"],
             ScheduleSpec(start="2024-06-20T16:23:30Z", repeat_period=Schedule.REPEAT_DAILY),
         )
 
@@ -468,6 +499,8 @@ class MailroomClientTest(TembaTest):
                     "started_previously": False,
                 },
                 "optin_id": optin.id,
+                "template_id": template.id,
+                "template_variables": ["@contact"],
                 "schedule": {"start": "2024-06-20T16:23:30Z", "repeat_period": "D", "repeat_days_of_week": None},
             },
         )
@@ -541,7 +574,7 @@ class MailroomClientTest(TembaTest):
     @patch("requests.post")
     def test_msg_send(self, mock_post):
         ann = self.create_contact("Ann", urns=["tel:+12340000001"])
-        ticket = self.create_ticket(ann, "Help")
+        ticket = self.create_ticket(ann)
         mock_post.return_value = MockJsonResponse(200, {"id": 12345})
         response = self.client.msg_send(self.org, self.admin, ann, "hi", [], ticket)
 
@@ -558,6 +591,19 @@ class MailroomClientTest(TembaTest):
                 "attachments": [],
                 "ticket_id": ticket.id,
             },
+        )
+
+    @patch("requests.post")
+    def test_org_deindex(self, mock_post):
+        mock_post.return_value = MockJsonResponse(200, {})
+        response = self.client.org_deindex(self.org)
+
+        self.assertEqual({}, response)
+
+        mock_post.assert_called_once_with(
+            "http://localhost:8090/mr/org/deindex",
+            headers={"User-Agent": "Temba", "Authorization": "Token sesame"},
+            json={"org_id": self.org.id},
         )
 
     def test_po_export(self):
@@ -597,8 +643,8 @@ class MailroomClientTest(TembaTest):
     def test_ticket_assign(self, mock_post):
         ann = self.create_contact("Ann", urns=["tel:+12340000001"])
         bob = self.create_contact("Bob", urns=["tel:+12340000002"])
-        ticket1 = self.create_ticket(ann, "Help")
-        ticket2 = self.create_ticket(bob, "Help")
+        ticket1 = self.create_ticket(ann)
+        ticket2 = self.create_ticket(bob)
 
         mock_post.return_value = MockJsonResponse(200, {"changed_ids": [ticket1.id]})
         response = self.client.ticket_assign(self.org, self.admin, [ticket1, ticket2], self.agent)
@@ -619,8 +665,8 @@ class MailroomClientTest(TembaTest):
     def test_ticket_add_note(self, mock_post):
         ann = self.create_contact("Ann", urns=["tel:+12340000001"])
         bob = self.create_contact("Bob", urns=["tel:+12340000002"])
-        ticket1 = self.create_ticket(ann, "Help")
-        ticket2 = self.create_ticket(bob, "Help")
+        ticket1 = self.create_ticket(ann)
+        ticket2 = self.create_ticket(bob)
 
         mock_post.return_value = MockJsonResponse(200, {"changed_ids": [ticket1.id]})
         response = self.client.ticket_add_note(self.org, self.admin, [ticket1, ticket2], "please handle")
@@ -641,8 +687,8 @@ class MailroomClientTest(TembaTest):
     def test_ticket_change_topic(self, mock_post):
         ann = self.create_contact("Ann", urns=["tel:+12340000001"])
         bob = self.create_contact("Bob", urns=["tel:+12340000002"])
-        ticket1 = self.create_ticket(ann, "Help")
-        ticket2 = self.create_ticket(bob, "Help")
+        ticket1 = self.create_ticket(ann)
+        ticket2 = self.create_ticket(bob)
         topic = Topic.create(self.org, self.admin, "Support")
 
         mock_post.return_value = MockJsonResponse(200, {"changed_ids": [ticket1.id]})
@@ -664,8 +710,8 @@ class MailroomClientTest(TembaTest):
     def test_ticket_close(self, mock_post):
         ann = self.create_contact("Ann", urns=["tel:+12340000001"])
         bob = self.create_contact("Bob", urns=["tel:+12340000002"])
-        ticket1 = self.create_ticket(ann, "Help")
-        ticket2 = self.create_ticket(bob, "Help")
+        ticket1 = self.create_ticket(ann)
+        ticket2 = self.create_ticket(bob)
 
         mock_post.return_value = MockJsonResponse(200, {"changed_ids": [ticket1.id]})
         response = self.client.ticket_close(self.org, self.admin, [ticket1, ticket2], force=True)
@@ -686,8 +732,8 @@ class MailroomClientTest(TembaTest):
     def test_ticket_reopen(self, mock_post):
         ann = self.create_contact("Ann", urns=["tel:+12340000001"])
         bob = self.create_contact("Bob", urns=["tel:+12340000002"])
-        ticket1 = self.create_ticket(ann, "Help")
-        ticket2 = self.create_ticket(bob, "Help")
+        ticket1 = self.create_ticket(ann)
+        ticket2 = self.create_ticket(bob)
 
         mock_post.return_value = MockJsonResponse(200, {"changed_ids": [ticket1.id]})
         response = self.client.ticket_reopen(self.org, self.admin, [ticket1, ticket2])
@@ -706,13 +752,6 @@ class MailroomClientTest(TembaTest):
     @patch("requests.post")
     def test_errors(self, mock_post):
         group = self.create_group("Doctors", contacts=[])
-
-        mock_post.return_value = MockJsonResponse(
-            422, {"error": "can't create broadcast with no recipients", "code": "broadcast:no_recipients"}
-        )
-
-        with self.assertRaises(EmptyBroadcastException) as e:
-            self.client.msg_broadcast(self.org, self.admin, {}, "eng", [], [], [], "", "", None, None, None)
 
         mock_post.return_value = MockJsonResponse(422, {"error": "node isn't valid", "code": "flow:invalid"})
 
@@ -742,7 +781,7 @@ class MailroomClientTest(TembaTest):
             self.client.contact_create(
                 self.org,
                 self.admin,
-                ContactSpec(name="Bob", language="eng", urns=["tel:+123456789"], fields={}, groups=[]),
+                ContactSpec(name="Bob", language="eng", status="active", urns=["tel:+123456789"], fields={}, groups=[]),
             )
 
         self.assertEqual("URN 1 is taken", e.exception.error)

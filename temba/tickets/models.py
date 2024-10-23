@@ -13,7 +13,7 @@ from django.utils.translation import gettext_lazy as _
 
 from temba import mailroom
 from temba.contacts.models import Contact
-from temba.orgs.models import DependencyMixin, Export, ExportType, Org, User, UserSettings
+from temba.orgs.models import DependencyMixin, Export, ExportType, Org, OrgMembership, User
 from temba.utils import chunk_list
 from temba.utils.dates import date_range
 from temba.utils.export import MultiSheetExporter
@@ -21,6 +21,31 @@ from temba.utils.models import DailyCountModel, DailyTimingModel, SquashableMode
 from temba.utils.uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+
+class Shortcut(TembaModel):
+    """
+    A canned response available from the ticketing interface.
+    """
+
+    org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="shortcuts")
+    text = models.TextField()
+
+    @classmethod
+    def create(cls, org, user, name: str, text: str):
+        assert cls.is_valid_name(name), f"'{name}' is not a valid shortcut name"
+        assert not org.shortcuts.filter(name__iexact=name).exists(), f"shortcut with name '{name}' already exists"
+
+        return org.shortcuts.create(name=name, text=text, created_by=user, modified_by=user)
+
+    def release(self, user):
+        self.is_active = False
+        self.name = self._deleted_name()
+        self.modified_by = user
+        self.save(update_fields=("name", "is_active", "modified_by", "modified_on"))
+
+    class Meta:
+        constraints = [models.UniqueConstraint("org", Lower("name"), name="unique_shortcut_names")]
 
 
 class Topic(TembaModel, DependencyMixin):
@@ -50,7 +75,7 @@ class Topic(TembaModel, DependencyMixin):
     @classmethod
     def create(cls, org, user, name: str):
         assert cls.is_valid_name(name), f"'{name}' is not a valid topic name"
-        assert not org.topics.filter(name__iexact=name).exists()
+        assert not org.topics.filter(name__iexact=name).exists(), f"topic with name '{name}' already exists"
 
         return org.topics.create(name=name, created_by=user, modified_by=user)
 
@@ -60,7 +85,7 @@ class Topic(TembaModel, DependencyMixin):
 
     def release(self, user):
         assert not (self.is_system and self.org.is_active), "can't release system topics"
-
+        assert not self.tickets.exists(), "can't release topic with tickets"
         super().release(user)
 
         self.is_active = False
@@ -84,15 +109,12 @@ class Ticket(models.Model):
     # permission that users need to have a ticket assigned to them
     ASSIGNEE_PERMISSION = "tickets.ticket_assignee"
 
-    MAX_NOTE_LEN = 4096
+    MAX_NOTE_LENGTH = 10_000
 
     uuid = models.UUIDField(unique=True, default=uuid4)
     org = models.ForeignKey(Org, on_delete=models.PROTECT, related_name="tickets", db_index=False)  # indexed below
     contact = models.ForeignKey(Contact, on_delete=models.PROTECT, related_name="tickets", db_index=False)
-
-    # ticket content
     topic = models.ForeignKey(Topic, on_delete=models.PROTECT, related_name="tickets")
-    body = models.TextField()
 
     # the status of this ticket and who it's currently assigned to
     status = models.CharField(max_length=1, choices=STATUS_CHOICES)
@@ -189,7 +211,7 @@ class TicketEvent(models.Model):
     ticket = models.ForeignKey(Ticket, on_delete=models.PROTECT, related_name="events")
     contact = models.ForeignKey(Contact, on_delete=models.PROTECT, related_name="ticket_events")
     event_type = models.CharField(max_length=1, choices=TYPE_CHOICES)
-    note = models.TextField(null=True, max_length=Ticket.MAX_NOTE_LEN)
+    note = models.TextField(null=True, max_length=Ticket.MAX_NOTE_LENGTH)
     topic = models.ForeignKey(Topic, on_delete=models.PROTECT, null=True, related_name="ticket_events")
     assignee = models.ForeignKey(User, on_delete=models.PROTECT, null=True, related_name="ticket_assignee_events")
 
@@ -396,11 +418,11 @@ class Team(TembaModel):
         return org.teams.create(name=name, created_by=user, modified_by=user)
 
     def get_users(self):
-        return User.objects.filter(settings__team=self)
+        return self.org.users.filter(orgmembership__team=self)
 
     def release(self, user):
         # remove all users from this team
-        UserSettings.objects.filter(team=self).update(team=None)
+        OrgMembership.objects.filter(org=self.org, team=self).update(team=None)
 
         self.name = self._deleted_name()
         self.is_active = False

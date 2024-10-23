@@ -39,12 +39,14 @@ class WhatsAppType(ChannelType):
     def get_urls(self):
         return [
             self.get_claim_url(),
-            re_path(r"^clear_session_token$", ClearSessionToken.as_view(channel_type=self), name="clear_session_token"),
             re_path(
-                r"^(?P<uuid>[a-z0-9\-]+)/request_code$", RequestCode.as_view(channel_type=self), name="request_code"
+                r"^clear_session_token/$", ClearSessionToken.as_view(channel_type=self), name="clear_session_token"
             ),
-            re_path(r"^(?P<uuid>[a-z0-9\-]+)/verify_code$", VerifyCode.as_view(channel_type=self), name="verify_code"),
-            re_path(r"^connect$", Connect.as_view(channel_type=self), name="connect"),
+            re_path(
+                r"^(?P<uuid>[a-z0-9\-]+)/request_code/$", RequestCode.as_view(channel_type=self), name="request_code"
+            ),
+            re_path(r"^(?P<uuid>[a-z0-9\-]+)/verify_code/$", VerifyCode.as_view(channel_type=self), name="verify_code"),
+            re_path(r"^connect/$", Connect.as_view(channel_type=self), name="connect"),
         ]
 
     def activate(self, channel):
@@ -88,7 +90,7 @@ class WhatsAppType(ChannelType):
 
                 templates.extend(response.json()["data"])
                 url = response.json().get("paging", {}).get("next", None)
-            except Exception as e:
+            except requests.RequestException as e:
                 HTTPLog.from_exception(HTTPLog.WHATSAPP_TEMPLATES_SYNCED, e, start, channel=channel)
                 raise e
 

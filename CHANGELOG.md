@@ -1,3 +1,518 @@
+v9.3.77 (2024-10-22)
+-------------------------
+ * Update django
+ * Update to python 3.12
+ * Simplify bulk labeling of msgs and flows
+ * Remove unused code from MsgCRUDL.Menu and add test
+
+v9.3.76 (2024-10-18)
+-------------------------
+ * Fix agents shortcuts permission
+
+v9.3.75 (2024-10-17)
+-------------------------
+ * Add Shortcuts UI
+ * Normal menu navigation for tickets
+
+v9.3.74 (2024-10-17)
+-------------------------
+ * Remove pre-spa days code from flow list view
+ * Add more clarifications to FreshChat claim page
+ * Cleanup channel claim pages with steps
+
+v9.3.73 (2024-10-17)
+-------------------------
+ * Overhaul UI for managing child workspaces
+
+v9.3.72 (2024-10-17)
+-------------------------
+ * Move org service view to staff app
+ * Drop Invitation.user_group and UserSettings.team
+
+v9.3.71 (2024-10-17)
+-------------------------
+ * Fix invitations count on org menu to exclude expired invitations
+
+v9.3.70 (2024-10-16)
+-------------------------
+ * Data migration to set Invitation.role_code
+
+v9.3.69 (2024-10-16)
+-------------------------
+ * Fix how we model team membership so that users can belong to different teams in different workspaces
+
+v9.3.68 (2024-10-16)
+-------------------------
+ * Tweak user update and delete forms to return 404 for users not in the current org
+
+v9.3.67 (2024-10-16)
+-------------------------
+ * New CRUDL views for org users and invitations
+
+v9.3.66 (2024-10-16)
+-------------------------
+ * Fix displaying the channel log missing HTTP response
+ * Fix claim number to display non field errors
+ * Remove support for user management of sub-orgs without switching to those orgs
+
+v9.3.65 (2024-10-10)
+-------------------------
+ * Add mixin for views that require a feature
+
+v9.3.64 (2024-10-09)
+-------------------------
+ * Fix modal for deleting a shortcut
+ * Tweak list view templates for consistency
+ * Data migration to tweak names of existing status groups
+
+v9.3.63 (2024-10-09)
+-------------------------
+ * Create status groups with invalid names to avoid conflicts with real group names
+ * Bump django from 5.1 to 5.1.1
+
+v9.3.62 (2024-10-08)
+-------------------------
+ * Fix double character rendering on autogrow inputs
+
+v9.3.61 (2024-10-08)
+-------------------------
+ * Move staff only rg and user views to new staff app
+
+v9.3.60 (2024-10-08)
+-------------------------
+ * Improve invitation emails
+
+v9.3.59 (2024-10-08)
+-------------------------
+ * Fix not creating invitation accepted notifications in case of new user signup
+
+v9.3.58 (2024-10-08)
+-------------------------
+ * Use mailroom to trigger android channel sync
+ * Add new notification type for when an invitation to join a workspace is accepted
+ * More refactoring of modal views
+
+v9.3.57 (2024-10-04)
+-------------------------
+ * More view refactoring
+
+v9.3.56 (2024-10-03)
+-------------------------
+ * Cleanup some view mixins
+
+v9.3.55 (2024-10-03)
+-------------------------
+ * Temporarily hide menu item for shortcuts
+ * Add pagination to flow starts and webhook logs pages
+ * Add internal API endpoint for fetching shortcuts
+ * Add model and CRUDL views for ticket shortcuts
+ * Fix topic create and update and tweak list pages for consistency
+
+v9.3.54 (2024-10-02)
+-------------------------
+ * Adjust background flow start preview to include all contacts in other flows
+ * Make template sync use consistent components order to avoid breaking flows variables
+
+v9.3.53 (2024-10-01)
+-------------------------
+ * Fix location aliases to only update in one workspace
+
+v9.3.52 (2024-09-30)
+-------------------------
+ * Add test_errors to mailroom client
+
+v9.3.51 (2024-09-27)
+-------------------------
+ * Update components with progress bar tweaks
+
+v9.3.50 (2024-09-27)
+-------------------------
+ * Add commas for broadcast message count
+
+v9.3.49 (2024-09-26)
+-------------------------
+ * Tweak deindexing a deleted contact
+
+v9.3.48 (2024-09-26)
+-------------------------
+ * Use 10th anniversary rp logo
+ * Explicitly de-index contacts when released
+ * Request de-indexing of contacts when hard deleting an org
+ * Switch to flowstart_list permission for status
+ * Add status and interrupt for broadcasts and starts
+
+v9.3.47 (2024-09-25)
+-------------------------
+ * Re-introduce QUEUED status for FlowStarts and Broadcasts
+ * Remove progress field from flow starts endpoint docs
+
+v9.3.46 (2024-09-23)
+-------------------------
+ * Add progress field to broadcasts API endpoint
+ * Add Broadcast.interrupt(user)
+
+v9.3.45 (2024-09-23)
+-------------------------
+ * Add PENDING/STARTED statuses and contact_count field to broadcasts
+
+v9.3.44 (2024-09-23)
+-------------------------
+ * Validate channel variable in the body for EX channels
+ * Replace broadcast status S with C
+
+v9.3.43 (2024-09-19)
+-------------------------
+ * Add support broadcast status (C)COMPLETED
+ * Remove broadcasts from Outbox now that they have their own page
+ * Put starts before webhooks on flow history menu
+
+v9.3.42 (2024-09-18)
+-------------------------
+ * Cleanup how we read and anonymize channel logs
+
+v9.3.41 (2024-09-18)
+-------------------------
+ * Limit SetRunResult category length in editor
+ * Add --testing argument to migrate_dynamo command
+ * Start reading attached channel logs from DynamoDB instead of S3
+
+v9.3.40 (2024-09-17)
+-------------------------
+ * Add INTERRUPTED as a status for flow starts
+ * Switch flow starting blocker to warning
+
+v9.3.39 (2024-09-17)
+-------------------------
+ * Show bad import file error as validation errors to the user
+ * Fix flow start progress bar with high pcts
+ * Simplify outbox limit to be hardcoded at 1M
+ * Validate body for EX channel type will be valid JSON after replacing variables
+
+v9.3.38 (2024-09-14)
+-------------------------
+ * Add flow start progress bar
+
+v9.3.37 (2024-09-13)
+-------------------------
+ * Fix import read page title
+ * Fix importing contacts from spreadsheet with broken dimensions
+ * Fix TTL attribute name on DynamoDB channel logs table
+
+v9.3.36 (2024-09-12)
+-------------------------
+ * Use 'tasks:batch' queue name instead of 'batch'
+
+v9.3.35 (2024-09-12)
+-------------------------
+ * Add progress field to flow starts endpoint
+
+v9.3.34 (2024-09-11)
+-------------------------
+ * Add timing controls around flow starts
+
+v9.3.33 (2024-09-11)
+-------------------------
+ * Rename dynamodb channel logs table
+
+v9.3.32 (2024-09-07)
+-------------------------
+ * Add outbox monitor for large queues
+
+v9.3.31 (2024-09-05)
+-------------------------
+ * Add an org limit for too many messages in outbox
+
+v9.3.30 (2024-09-02)
+-------------------------
+ * Import cell data value instead of formulas using data_only flag to load the workbook
+
+v9.3.29 (2024-08-27)
+-------------------------
+ * Fix authorization code, verification, redirect URI
+
+v9.3.28 (2024-08-27)
+-------------------------
+ * Authorization code cannot be debugged
+ * Fix channel URLs to have a trailing slash
+ * Delete no longer used test flows
+ * Simplify functions for loading flows in tests and move flows used by legacy migration tests into their own directory
+ * TembaTest.create_flow should return a flow in latest version without migrating
+ * Only import real flows in tests where it's required
+ * Update README.md
+
+v9.3.27 (2024-08-21)
+-------------------------
+ * Updates to migrate_dynamo command
+
+v9.3.26 (2024-08-21)
+-------------------------
+ * Add redirect for contact interrupt
+ * Create dynamo table with on-demand billing by default
+
+v9.3.25 (2024-08-21)
+-------------------------
+ * Fix matching for invites with email case insensitively
+ * Tweak migrate_dynamo command
+
+v9.3.24 (2024-08-20)
+-------------------------
+ * Add dynamo table prefix setting
+
+v9.3.23 (2024-08-20)
+-------------------------
+ * Add management command to create DynamoDB tables
+ * Add option for connection pooling
+
+v9.3.22 (2024-08-19)
+-------------------------
+ * Drop APIToken.role field
+
+v9.3.21 (2024-08-19)
+-------------------------
+ * Use correct URL when breaking spa-container
+ * Delete API tokens when user deleted and use generate_secret to create new tokens
+ * Update API token management UI to support multiple tokens
+
+v9.3.20 (2024-08-14)
+-------------------------
+ * Rework S3 code to always use real S3 clients, even in tests
+
+v9.3.19 (2024-08-14)
+-------------------------
+ * Fix DTOne formax section
+ * Change default settings to use minio for file storage
+
+v9.3.18 (2024-08-13)
+-------------------------
+ * Record when API tokens were last used
+ * Only support import contacts using .xlsx files with openpyxl
+
+v9.3.17 (2024-08-12)
+-------------------------
+ * Data migration to delete old surveyor and prometheus API tokens
+
+v9.3.16 (2024-08-08)
+-------------------------
+ * Stop generating prometheus API tokens
+ * Drop Ticket.body
+
+v9.3.15 (2024-08-08)
+-------------------------
+ * Add Org.prometheus_token and backill from API tokens
+
+v9.3.14 (2024-08-08)
+-------------------------
+ * Update tests to not set ticket body
+ * Add data migration to move body to ticket on open ticket event
+
+v9.3.13 (2024-08-08)
+-------------------------
+ * Show notes on ticket open events in contact history
+ * Remove body from ticket endpoint documentation
+ * Update floweditor which now also refers to ticket body as note
+ * Update open ticket modal to use note instead of body
+ * Add cutoff date for using viewer role
+
+v9.3.12 (2024-08-07)
+-------------------------
+ * Don't create surveyor user in mailroom test db
+ * Add warning to manage accounts page if org has viewers
+ * Remove viewers as an org feature, only allow existing viewer users to remain as viewers
+ * Update to latest Django
+
+v9.3.11 (2024-08-07)
+-------------------------
+ * Remove Org.surveyor_password and always disable creating surveyor flows
+ * Remove non-modal response support from export translation view
+ * Remove surveyor user role and test user
+
+v9.3.10 (2024-08-07)
+-------------------------
+ * Remove surveyor users from workspaces
+
+v9.3.9 (2024-08-07)
+-------------------------
+ * Fix incidents templates name
+ * Let Ticket.body be null and make note length match contact note length
+
+v9.3.8 (2024-08-06)
+-------------------------
+ * Show tabs on tickets when contact is set
+
+v9.3.7 (2024-08-06)
+-------------------------
+ * Add contact notes ui
+
+v9.3.6 (2024-08-06)
+-------------------------
+ * Adjust the grant view for new UI
+ * Fix Android claim page
+ * Add incident for Android client app version out of date
+ * Tweak fail_old_messages to only fail Android messages and add an index
+
+v9.3.5 (2024-07-31)
+-------------------------
+ * Support FCM changes
+ * Require E164 phone numbers for contacts created from UI
+
+v9.3.4 (2024-07-30)
+-------------------------
+ * Add contact notes and expose over contacts API endpoint
+
+v9.3.3 (2024-07-29)
+-------------------------
+ * Clamp messages on message views to one line
+ * Adjust max length for AT API key
+ * Make 'New Field' a button
+
+v9.3.2 (2024-07-29)
+-------------------------
+ * Allow deleting of empty ticket topics
+ * Add support for buttons in side menu and use where appropriate
+
+v9.3.0 (2024-07-25)
+-------------------------
+ * Add User.get_by_email to ensure consistent behaviour where we look up a user by their email
+ * Omnibox fixes and cleanup
+
+v9.2.5 (2024-07-24)
+-------------------------
+ * Ensure that emails are consistently treated as case insensitive
+
+v9.2.4 (2024-07-23)
+-------------------------
+ * Simplify FCM config setting names
+
+v9.2.3 (2024-07-23)
+-------------------------
+ * More updates to WhatsApp claiming
+
+v9.2.2 (2024-07-23)
+-------------------------
+ * Fix WhatsApp embedded signup
+
+v9.2.1 (2024-07-18)
+-------------------------
+ * Catch errors from xlrd reading import rows and return errors with row numbers
+ * Update xlrd
+ * Honor meta key keyboard press inside contact chat
+
+v9.2.0 (2024-07-17)
+-------------------------
+ * Simplify permissions in flows app
+ * Tweak menu items for msg views and flow results
+
+v9.1.198 (2024-07-17)
+-------------------------
+ * Allow template image variables to be text with expressions
+
+v9.1.196 (2024-07-16)
+-------------------------
+ * Add __repr__ to more models and tweak existing ones for consistency
+ * Fix rendering of flow starts for deleted flows
+ * Add data migration to trim old broadcasts to nodes that resulted in very large contact lists
+
+v9.1.195 (2024-07-16)
+-------------------------
+ * Remove special error handling for broadcast to node that resolves to no recipients
+ * Fix setting a template on a new broadcast
+ * Fix query broadcast creation and update
+ * Add rendering of exclusions on broadcasts
+ * Fix not showing query on broadcast recipients list and add node_uuid
+
+v9.1.194 (2024-07-15)
+-------------------------
+ * Add Broadcast.node_uuid field
+ * Remove old code for getting message created_by from broadcasts
+ * Make some exception clauses more specific
+
+v9.1.193 (2024-07-15)
+-------------------------
+ * Replace TemplateTranslation.STATUS_UNSUPPORTED completely
+
+v9.1.192 (2024-07-15)
+-------------------------
+ * Add new template statuses and stop using fake "unsupported" status
+
+v9.1.191 (2024-07-15)
+-------------------------
+ * Fix deactivating a legacy WhatsApp channel
+ * Update format of templates on API endpoint
+ * Show template translation problems as errors on template read page
+
+v9.1.190 (2024-07-12)
+-------------------------
+ * Fix padding for broadcast schedule update
+
+v9.1.189 (2024-07-12)
+-------------------------
+ * Fix mailroom_db
+ * Data migration to populate TemplateTranslation.is_supported and is_compatible
+
+v9.1.188 (2024-07-12)
+-------------------------
+ * Add new boolean fields to TemplateTranslation model to determine whether it's usable
+
+v9.1.187 (2024-07-12)
+-------------------------
+ * Add templates to broadcasts
+
+v9.1.186 (2024-07-11)
+-------------------------
+ * Fix handling of POSTs to API docs
+ * Exclude empty templates from list, and show base translation apart on read page
+ * Ensure we choose a new base for a template whenever an existing base translation is deleted
+
+v9.1.185 (2024-07-11)
+-------------------------
+ * Update deps
+ * Replace telegram library by requests use
+ * Fix dashboard menu link permission
+ * Expose Template.base_translation on API endpoint
+
+v9.1.184 (2024-07-11)
+-------------------------
+ * Use dropdowns for location fields
+
+v9.1.183 (2024-07-11)
+-------------------------
+ * Use dropdowns for location fields
+
+v9.1.182 (2024-07-10)
+-------------------------
+ * Locations API endpoint should allow searching on the path
+ * Fix template syncing when channel gives us invalid template data
+
+v9.1.181 (2024-07-10)
+-------------------------
+ * Add Template.base_translation
+ * Fix dashboard workspace data
+ * Allow creation of contacts with non-active statuses
+
+v9.1.180 (2024-07-10)
+-------------------------
+ * Drop no longer used is_active field from TemplateTranslation
+ * Tweak wording on template list page
+ * Add db constraint to ensure contact status is valid
+
+v9.1.179 (2024-07-10)
+-------------------------
+ * Keep FCM ID in channel config when soft deleting the channel
+ * Stop using TemplateTranslation.is_active and make nullable
+
+v9.1.178 (2024-07-09)
+-------------------------
+ * Allow broadcast creation with zero matches
+
+v9.1.177 (2024-07-08)
+-------------------------
+ * Hard delete remaining soft-deleted template translations
+
+v9.1.176 (2024-07-08)
+-------------------------
+ * Update Template to a TembaModel
+ * Hard delete template translations that no longer exist on the channel side
+
 v9.1.175 (2024-07-05)
 -------------------------
  * Make send_when optional when updating broadcasts
